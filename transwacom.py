@@ -65,7 +65,123 @@ def autodetect_input_devices():
     return devices
 
 
-def server_mode(device_path, remote_host, remote_port):
+def get_wacom_device_id(device_path):
+    """Obtiene el ID del dispositivo Wacom para xsetwacom"""
+    try:
+        result = subprocess.run(["xsetwacom", "--list", "devices"], 
+                              capture_output=True, text=True, check=True)
+        
+        # Buscar líneas que contengan el nombre del dispositivo
+        for line in result.stdout.splitlines():
+            if device_path.split('/')[-1] in line or "event" in line:
+                # Formato: "Device Name id: X type: TYPE"
+                parts = line.split()
+                for i, part in enumerate(parts):
+                    if part == "id:":
+                        return parts[i + 1]
+        
+        # Alternativa: buscar por nombre del dispositivo usando xinput
+        result = subprocess.run(["xinput", "list", "--name-only"], 
+                              capture_output=True, text=True, check=True)
+        for line in result.stdout.splitlines():
+            if "wacom" in line.lower() or "pen" in line.lower():
+                return line.strip()
+                
+    except Exception as e:
+        print(f"No se pudo obtener ID del dispositivo Wacom: {e}")
+    
+    return None
+
+
+def disable_wacom_locally(device_path, device_id=None):
+    """Desactiva la tableta Wacom del sistema local X11/Wayland"""
+    if not device_id:
+        device_id = get_wacom_device_id(device_path)
+    
+    if not device_id:
+        print("No se pudo identificar el dispositivo Wacom para desactivar")
+        return False
+    
+    try:
+        # Intentar con xinput (funciona en X11 y algunas configuraciones Wayland)
+        result = subprocess.run(["xinput", "disable", device_id], 
+                              capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"Dispositivo {device_id} desactivado localmente con xinput")
+            return True
+        
+        # Intentar con xsetwacom
+        result = subprocess.run(["xsetwacom", "--set", device_id, "Touch", "off"], 
+                              capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"Dispositivo {device_id} desactivado localmente con xsetwacom")
+            return True
+            
+    except Exception as e:
+        print(f"Error desactivando dispositivo localmente: {e}")
+    
+    return False
+
+
+def enable_wacom_locally(device_id):
+    """Reactiva la tableta Wacom en el sistema local"""
+    try:
+        # Intentar con xinput
+        result = subprocess.run(["xinput", "enable", device_id], 
+                              capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"Dispositivo {device_id} reactivado localmente")
+            return True
+            
+        # Intentar con xsetwacom
+        result = subprocess.run(["xsetwacom", "--set", device_id, "Touch", "on"], 
+                              capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"Dispositivo {device_id} reactivado localmente")
+            return True
+            
+    except Exception as e:
+        print(f"Error reactivando dispositivo: {e}")
+    
+    return False
+
+
+def set_wacom_relative_mode(device_id):
+    """Pone la tableta Wacom en modo relativo (como ratón)"""
+    if not device_id:
+        return False
+        
+    try:
+        # Usar xsetwacom para poner en modo relativo
+        result = subprocess.run(["xsetwacom", "--set", device_id, "Mode", "Relative"], 
+                              capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"Dispositivo {device_id} configurado en modo relativo")
+            return True
+    except Exception as e:
+        print(f"Error configurando modo relativo: {e}")
+    
+    return False
+
+
+def restore_wacom_absolute_mode(device_id):
+    """Restaura la tableta Wacom a modo absoluto (normal)"""
+    if not device_id:
+        return False
+        
+    try:
+        result = subprocess.run(["xsetwacom", "--set", device_id, "Mode", "Absolute"], 
+                              capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"Dispositivo {device_id} restaurado a modo absoluto")
+            return True
+    except Exception as e:
+        print(f"Error restaurando modo absoluto: {e}")
+    
+    return False
+
+
+def server_mode(device_path, remote_host, remote_port, disable_local=True, relative_mode=True):
     """Modo servidor: lee dispositivo de entrada y reenvía eventos por red"""
     print(f"Usando dispositivo: {device_path}")
     
@@ -81,6 +197,23 @@ def server_mode(device_path, remote_host, remote_port):
     except Exception as e:
         print(f"No se pudo abrir {device_path}: {e}")
         sys.exit(1)
+
+    # Configurar tableta Wacom si es detectada
+    device_id = None
+    was_disabled = False
+    was_relative = False
+    
+    if "wacom" in device.name.lower() or "pen" in device.name.lower():
+        device_id = get_wacom_device_id(device_path)
+        
+        if device_id:
+            if relative_mode:
+                was_relative = set_wacom_relative_mode(device_id)
+                
+            if disable_local:
+                was_disabled = disable_wacom_locally(device_path, device_id)
+        else:
+            print("Advertencia: No se pudo identificar el dispositivo Wacom para configuración")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -105,6 +238,13 @@ def server_mode(device_path, remote_host, remote_port):
     except KeyboardInterrupt:
         print("Daemon detenido por el usuario.")
     finally:
+        # Restaurar configuración original de la tableta
+        if device_id:
+            if was_disabled:
+                enable_wacom_locally(device_id)
+            if was_relative:
+                restore_wacom_absolute_mode(device_id)
+        
         device.close()
         sock.close()
 
@@ -245,6 +385,12 @@ def main():
                        help='Tipo de dispositivo virtual (modo cliente)')
     parser.add_argument('--daemon', action='store_true', help='Ejecutar como daemon (solo modo servidor)')
     
+    # Nuevas opciones para el modo servidor
+    parser.add_argument('--no-disable-local', action='store_true', 
+                       help='No desactivar el dispositivo localmente (mantener activo en X11/Wayland)')
+    parser.add_argument('--no-relative-mode', action='store_true',
+                       help='No poner la tableta en modo relativo (mantener modo absoluto)')
+    
     args = parser.parse_args()
     
     if args.list:
@@ -282,7 +428,11 @@ def main():
             if os.fork() > 0:
                 sys.exit(0)
         
-        server_mode(device_path, args.host, args.port)
+        # Configurar opciones del servidor
+        disable_local = not args.no_disable_local
+        relative_mode = not args.no_relative_mode
+        
+        server_mode(device_path, args.host, args.port, disable_local, relative_mode)
     
     elif args.client:
         client_mode(args.port, args.type)
