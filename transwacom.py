@@ -18,29 +18,13 @@ def autodetect_wacom_device():
         lines = result.stdout.splitlines()
         for line in lines:
             line = line.strip()
-            if line.startswith("- /dev/input/") or line.startswith("/dev/input/"):
-                # YAML:   - /dev/input/event11: 'Wacom ...'
-                dev = line.split()[0].replace("-", "").strip()
-                dev = dev.split(":")[0]
+            # En YAML, los nodos aparecen como: - /dev/input/event11: 'Nombre'
+            if line.startswith('- /dev/input/event'):
+                # Extraer el path eliminando el guion inicial y todo después de ':'
+                dev = line[1:].strip().split(':')[0].strip()
                 if os.path.exists(dev):
                     return dev
-            if line.startswith("nodes:"):
-                # Buscar la siguiente línea con el path
-                idx = lines.index(line)
-                for l in lines[idx+1:]:
-                    l = l.strip()
-                    if l.startswith("- /dev/input/"):
-                        dev = l.split()[0].replace("-", "").strip()
-                        dev = dev.split(":")[0]
-                        if os.path.exists(dev):
-                            return dev
-        # Fallback: buscar event* en la salida
-        for line in lines:
-            if "/dev/input/event" in line:
-                dev = line.split()[0].replace("-", "").strip()
-                dev = dev.split(":")[0]
-                if os.path.exists(dev):
-                    return dev
+        print("No se encontró ningún dispositivo /dev/input/event* en la salida YAML de libwacom-list-local-devices.")
     except Exception as e:
         print(f"Error autodetectando tableta: {e}")
     return None
