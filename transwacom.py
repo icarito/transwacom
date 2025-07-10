@@ -10,9 +10,14 @@ import struct
 
 try:
     import evdev
-    from evdev import InputDevice, UInput, ecodes as e, AbsInfo
+    from evdev import InputDevice, UInput, ecodes, AbsInfo
     EVDEV_AVAILABLE = True
 except ImportError:
+    evdev = None
+    InputDevice = None
+    UInput = None
+    ecodes = None
+    AbsInfo = None
     EVDEV_AVAILABLE = False
     print("Advertencia: python-evdev no está instalado. El modo cliente no funcionará.")
 
@@ -46,10 +51,10 @@ def autodetect_input_devices():
                     capabilities = device.capabilities()
                     
                     # Es un joystick si tiene ejes X/Y y botones
-                    if (e.EV_ABS in capabilities and 
-                        e.EV_KEY in capabilities and
-                        (e.ABS_X in capabilities.get(e.EV_ABS, []) or 
-                         e.ABS_RX in capabilities.get(e.EV_ABS, []))):
+                    if (ecodes.EV_ABS in capabilities and 
+                        ecodes.EV_KEY in capabilities and
+                        (ecodes.ABS_X in capabilities.get(ecodes.EV_ABS, []) or 
+                         ecodes.ABS_RX in capabilities.get(ecodes.EV_ABS, []))):
                         devices.append(('joystick', dev_path, device.name))
                     device.close()
                 except:
@@ -65,19 +70,17 @@ def server_mode(device_path, remote_host, remote_port):
     print(f"Usando dispositivo: {device_path}")
     
     if not EVDEV_AVAILABLE:
-        # Fallback: leer datos binarios directamente
-        try:
-            device = open(device_path, "rb")
-        except Exception as e:
-            print(f"No se pudo abrir {device_path}: {e}")
-            sys.exit(1)
-    else:
-        # Usar evdev para leer eventos estructurados
-        try:
-            device = InputDevice(device_path)
-        except Exception as e:
-            print(f"No se pudo abrir {device_path}: {e}")
-            sys.exit(1)
+        print("Error: python-evdev es requerido para el modo servidor.")
+        print("Instala con: pip install evdev")
+        sys.exit(1)
+    
+    # Usar evdev para leer eventos estructurados
+    try:
+        device = InputDevice(device_path)
+        print(f"Dispositivo: {device.name}")
+    except Exception as e:
+        print(f"No se pudo abrir {device_path}: {e}")
+        sys.exit(1)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -89,29 +92,20 @@ def server_mode(device_path, remote_host, remote_port):
 
     print("Enviando eventos del dispositivo...")
     try:
-        if not EVDEV_AVAILABLE:
-            # Modo binario simple
-            while True:
-                data = device.read(1024)
-                if not data:
-                    break
-                sock.sendall(data)
-        else:
-            # Modo evdev estructurado
-            for event in device.read_loop():
-                event_data = {
-                    'type': event.type,
-                    'code': event.code,
-                    'value': event.value,
-                    'timestamp': event.timestamp()
-                }
-                msg = json.dumps(event_data).encode() + b'\n'
-                sock.sendall(msg)
+        # Modo evdev estructurado (siempre JSON)
+        for event in device.read_loop():
+            event_data = {
+                'type': event.type,
+                'code': event.code,
+                'value': event.value,
+                'timestamp': event.timestamp()
+            }
+            msg = json.dumps(event_data).encode() + b'\n'
+            sock.sendall(msg)
     except KeyboardInterrupt:
         print("Daemon detenido por el usuario.")
     finally:
-        if hasattr(device, 'close'):
-            device.close()
+        device.close()
         sock.close()
 
 
@@ -124,17 +118,17 @@ def create_virtual_device(device_type='wacom'):
     if device_type == 'wacom':
         # Configuración para tableta Wacom
         cap = {
-            e.EV_ABS: [
-                (e.ABS_X, AbsInfo(value=0, min=0, max=15360, fuzz=0, flat=0, resolution=100)),
-                (e.ABS_Y, AbsInfo(value=0, min=0, max=10240, fuzz=0, flat=0, resolution=100)),
-                (e.ABS_PRESSURE, AbsInfo(value=0, min=0, max=2047, fuzz=0, flat=0, resolution=0)),
-                (e.ABS_TILT_X, AbsInfo(value=0, min=-64, max=63, fuzz=0, flat=0, resolution=0)),
-                (e.ABS_TILT_Y, AbsInfo(value=0, min=-64, max=63, fuzz=0, flat=0, resolution=0)),
-                (e.ABS_DISTANCE, AbsInfo(value=0, min=0, max=63, fuzz=0, flat=0, resolution=0)),
+            ecodes.EV_ABS: [
+                (ecodes.ABS_X, AbsInfo(value=0, min=0, max=15360, fuzz=0, flat=0, resolution=100)),
+                (ecodes.ABS_Y, AbsInfo(value=0, min=0, max=10240, fuzz=0, flat=0, resolution=100)),
+                (ecodes.ABS_PRESSURE, AbsInfo(value=0, min=0, max=2047, fuzz=0, flat=0, resolution=0)),
+                (ecodes.ABS_TILT_X, AbsInfo(value=0, min=-64, max=63, fuzz=0, flat=0, resolution=0)),
+                (ecodes.ABS_TILT_Y, AbsInfo(value=0, min=-64, max=63, fuzz=0, flat=0, resolution=0)),
+                (ecodes.ABS_DISTANCE, AbsInfo(value=0, min=0, max=63, fuzz=0, flat=0, resolution=0)),
             ],
-            e.EV_KEY: [
-                e.BTN_TOOL_PEN, e.BTN_TOOL_RUBBER, e.BTN_TOUCH,
-                e.BTN_STYLUS, e.BTN_STYLUS2
+            ecodes.EV_KEY: [
+                ecodes.BTN_TOOL_PEN, ecodes.BTN_TOOL_RUBBER, ecodes.BTN_TOUCH,
+                ecodes.BTN_STYLUS, ecodes.BTN_STYLUS2
             ]
         }
         name = 'Virtual Wacom Tablet'
@@ -142,21 +136,21 @@ def create_virtual_device(device_type='wacom'):
     elif device_type == 'joystick':
         # Configuración para joystick/gamepad
         cap = {
-            e.EV_ABS: [
-                (e.ABS_X, AbsInfo(value=0, min=-32768, max=32767, fuzz=0, flat=0, resolution=0)),
-                (e.ABS_Y, AbsInfo(value=0, min=-32768, max=32767, fuzz=0, flat=0, resolution=0)),
-                (e.ABS_RX, AbsInfo(value=0, min=-32768, max=32767, fuzz=0, flat=0, resolution=0)),
-                (e.ABS_RY, AbsInfo(value=0, min=-32768, max=32767, fuzz=0, flat=0, resolution=0)),
-                (e.ABS_Z, AbsInfo(value=0, min=0, max=255, fuzz=0, flat=0, resolution=0)),
-                (e.ABS_RZ, AbsInfo(value=0, min=0, max=255, fuzz=0, flat=0, resolution=0)),
-                (e.ABS_HAT0X, AbsInfo(value=0, min=-1, max=1, fuzz=0, flat=0, resolution=0)),
-                (e.ABS_HAT0Y, AbsInfo(value=0, min=-1, max=1, fuzz=0, flat=0, resolution=0)),
+            ecodes.EV_ABS: [
+                (ecodes.ABS_X, AbsInfo(value=0, min=-32768, max=32767, fuzz=0, flat=0, resolution=0)),
+                (ecodes.ABS_Y, AbsInfo(value=0, min=-32768, max=32767, fuzz=0, flat=0, resolution=0)),
+                (ecodes.ABS_RX, AbsInfo(value=0, min=-32768, max=32767, fuzz=0, flat=0, resolution=0)),
+                (ecodes.ABS_RY, AbsInfo(value=0, min=-32768, max=32767, fuzz=0, flat=0, resolution=0)),
+                (ecodes.ABS_Z, AbsInfo(value=0, min=0, max=255, fuzz=0, flat=0, resolution=0)),
+                (ecodes.ABS_RZ, AbsInfo(value=0, min=0, max=255, fuzz=0, flat=0, resolution=0)),
+                (ecodes.ABS_HAT0X, AbsInfo(value=0, min=-1, max=1, fuzz=0, flat=0, resolution=0)),
+                (ecodes.ABS_HAT0Y, AbsInfo(value=0, min=-1, max=1, fuzz=0, flat=0, resolution=0)),
             ],
-            e.EV_KEY: [
-                e.BTN_A, e.BTN_B, e.BTN_X, e.BTN_Y,
-                e.BTN_TL, e.BTN_TR, e.BTN_TL2, e.BTN_TR2,
-                e.BTN_SELECT, e.BTN_START, e.BTN_MODE,
-                e.BTN_THUMBL, e.BTN_THUMBR
+            ecodes.EV_KEY: [
+                ecodes.BTN_A, ecodes.BTN_B, ecodes.BTN_X, ecodes.BTN_Y,
+                ecodes.BTN_TL, ecodes.BTN_TR, ecodes.BTN_TL2, ecodes.BTN_TR2,
+                ecodes.BTN_SELECT, ecodes.BTN_START, ecodes.BTN_MODE,
+                ecodes.BTN_THUMBL, ecodes.BTN_THUMBR
             ]
         }
         name = 'Virtual Gamepad'
@@ -206,11 +200,25 @@ def client_mode(listen_port, device_type='wacom'):
                         line, buffer = buffer.split(b'\n', 1)
                         if line:
                             try:
-                                event_data = json.loads(line.decode())
-                                # Inyectar evento en dispositivo virtual
-                                virtual_device.write(event_data['type'], event_data['code'], event_data['value'])
-                                if event_data['type'] == e.EV_SYN:
-                                    virtual_device.syn()
+                                # Intentar decodificar como UTF-8
+                                line_str = line.decode('utf-8')
+                                event_data = json.loads(line_str)
+                                
+                                # Validar que el evento tenga los campos necesarios
+                                if all(key in event_data for key in ['type', 'code', 'value']):
+                                    # Inyectar evento en dispositivo virtual
+                                    virtual_device.write(event_data['type'], event_data['code'], event_data['value'])
+                                    if event_data['type'] == ecodes.EV_SYN:
+                                        virtual_device.syn()
+                                else:
+                                    print(f"Evento inválido (faltan campos): {event_data}")
+                                    
+                            except UnicodeDecodeError as e:
+                                print(f"Error de codificación (datos no UTF-8): {e}")
+                                # El servidor podría estar enviando datos binarios
+                                print("El servidor parece estar enviando datos binarios. Asegúrate de que use evdev.")
+                            except json.JSONDecodeError as e:
+                                print(f"Error JSON: {e} - Línea: {line[:50]}")
                             except Exception as e:
                                 print(f"Error procesando evento: {e}")
                                 
