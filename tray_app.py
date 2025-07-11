@@ -9,6 +9,7 @@ import time
 import threading
 import logging
 import signal
+import socket
 from typing import Dict, List, Optional, Callable, Any
 from pathlib import Path
 from functools import partial
@@ -142,9 +143,11 @@ class HostTrayApp(TrayIcon):
         # State
         self.discovered_consumers: Dict[str, DiscoveredConsumer] = {}
         self.active_connection = None
+        self.active_socket = None  # Store the actual socket for connection monitoring
         self.local_devices = []
         self._updating_menu = False  # Flag to prevent recursion
         self._menu_update_timer = None  # Timer for delayed updates
+        self._connection_monitor_timer = None  # Timer for connection monitoring
         
         # Setup network discovery
         self._setup_discovery()
@@ -378,10 +381,21 @@ class HostTrayApp(TrayIcon):
             
             if connection:
                 logger.debug("Connection established, setting up input capture...")
+                
+                # Store socket for connection monitoring
+                self.active_socket = connection
+                
                 # Start input capturing for this device
                 def event_callback(device_type: str, events):
-                    event_dicts = [event.to_dict() for event in events]
-                    self.network.send_events(connection, device_type, event_dicts)
+                    try:
+                        event_dicts = [event.to_dict() for event in events]
+                        success = self.network.send_events(connection, device_type, event_dicts)
+                        if not success:
+                            logger.warning("Failed to send events - connection may be lost")
+                            self._handle_connection_lost()
+                    except Exception as e:
+                        logger.error(f"Error sending events: {e}")
+                        self._handle_connection_lost()
                 
                 logger.debug("Getting config settings for input manager...")
                 use_relative = self.config.should_use_relative_mode()
@@ -395,6 +409,10 @@ class HostTrayApp(TrayIcon):
                     use_relative,
                     disable_local
                 )
+                
+                if success:
+                    # Start connection monitoring
+                    self._start_connection_monitoring()
                 
                 logger.debug(f"Input capture started: {success}")
                 return success
@@ -412,13 +430,132 @@ class HostTrayApp(TrayIcon):
         """Disconnect from consumer."""
         try:
             if self.active_connection:
+                # Stop connection monitoring
+                self._stop_connection_monitoring()
+                
+                # Stop input captures
                 self.input_manager.stop_all_captures()
+                
+                # Clean up socket
+                if self.active_socket:
+                    try:
+                        self.network.disconnect_from_consumer(self.active_socket)
+                    except Exception as e:
+                        logger.error(f"Error during socket cleanup: {e}")
+                    self.active_socket = None
+                
+                # Update state
                 self.active_connection = None
                 self.icon.icon = self.create_icon_image("blue", "idle")
                 self.show_notification("TransWacom", "Desconectado")
                 self._schedule_menu_update()
         except Exception as e:
             logger.error(f"Disconnect error: {e}")
+
+    def _start_connection_monitoring(self):
+        """Start monitoring the active connection."""
+        if self._connection_monitor_timer:
+            self._connection_monitor_timer.cancel()
+        
+        def monitor():
+            try:
+                if self.active_socket and self.active_connection:
+                    # Check if socket is still valid
+                    if not self._is_socket_connected(self.active_socket):
+                        logger.warning("Connection monitoring detected lost connection")
+                        self._handle_connection_lost()
+                        return
+                    
+                    # Schedule next check
+                    self._connection_monitor_timer = threading.Timer(2.0, monitor)  # Check every 2 seconds
+                    self._connection_monitor_timer.start()
+            except Exception as e:
+                logger.error(f"Error in connection monitoring: {e}")
+                self._handle_connection_lost()
+        
+        # Start monitoring with initial delay
+        self._connection_monitor_timer = threading.Timer(2.0, monitor)
+        self._connection_monitor_timer.start()
+        logger.debug("Connection monitoring started")
+
+    def _stop_connection_monitoring(self):
+        """Stop connection monitoring."""
+        if self._connection_monitor_timer:
+            self._connection_monitor_timer.cancel()
+            self._connection_monitor_timer = None
+            logger.debug("Connection monitoring stopped")
+
+    def _is_socket_connected(self, sock) -> bool:
+        """Check if a socket is still connected."""
+        try:
+            # Try to get socket error status
+            error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if error:
+                return False
+            
+            # Try to send a small amount of data with MSG_DONTWAIT
+            # This is a non-blocking operation to test the connection
+            sock.send(b'', socket.MSG_DONTWAIT)
+            return True
+        except socket.error as e:
+            # Common errors that indicate disconnection
+            import errno
+            if e.errno in (errno.ENOTCONN, errno.ECONNRESET, errno.EPIPE, errno.ECONNABORTED):
+                return False
+            # For other errors, assume still connected (might be temporary)
+            return True
+        except Exception:
+            return False
+
+    def _handle_connection_lost(self):
+        """Handle lost connection with automatic recovery."""
+        try:
+            logger.warning("Connection lost detected - performing automatic recovery")
+            
+            # Prevent multiple simultaneous recovery attempts
+            if not hasattr(self, '_recovering') or not self._recovering:
+                self._recovering = True
+                
+                # Stop connection monitoring
+                self._stop_connection_monitoring()
+                
+                # Force stop input captures to restore device states
+                logger.info("Restoring input devices after connection loss...")
+                self.input_manager.stop_all_captures()
+                
+                # Clean up connection state
+                if self.active_socket:
+                    try:
+                        self.active_socket.close()
+                    except Exception:
+                        pass
+                    self.active_socket = None
+                
+                self.active_connection = None
+                
+                # Update UI
+                self.icon.icon = self.create_icon_image("red", "error")
+                self.show_notification(
+                    "Conexión Perdida", 
+                    "Se perdió la conexión con el consumer. Dispositivos restaurados.",
+                    timeout=10
+                )
+                
+                self._schedule_menu_update()
+                
+                # Reset recovery flag after a delay
+                def reset_recovery():
+                    self._recovering = False
+                
+                threading.Timer(5.0, reset_recovery).start()
+                
+        except Exception as e:
+            logger.error(f"Error handling connection loss: {e}")
+            try:
+                # Emergency cleanup
+                self._emergency_cleanup()
+            except Exception as cleanup_error:
+                logger.error(f"Emergency cleanup also failed: {cleanup_error}")
     
     def _refresh_devices(self, icon, item):
         """Refresh device list."""
@@ -457,6 +594,9 @@ class HostTrayApp(TrayIcon):
         if self._menu_update_timer:
             self._menu_update_timer.cancel()
         
+        # Stop connection monitoring
+        self._stop_connection_monitoring()
+        
         # Ensure all captures are stopped (even if no active connection)
         try:
             logger.info("Stopping all input captures...")
@@ -477,10 +617,23 @@ class HostTrayApp(TrayIcon):
         logger.info("Performing emergency cleanup...")
         
         try:
+            # Stop connection monitoring
+            if hasattr(self, '_connection_monitor_timer') and self._connection_monitor_timer:
+                self._connection_monitor_timer.cancel()
+                self._connection_monitor_timer = None
+            
             # Force stop all input captures to restore device states
             if hasattr(self, 'input_manager'):
                 logger.info("Stopping all input captures...")
                 self.input_manager.stop_all_captures()
+            
+            # Clean up connection state
+            if hasattr(self, 'active_socket') and self.active_socket:
+                try:
+                    self.active_socket.close()
+                except Exception:
+                    pass
+                self.active_socket = None
             
             # Clear active connection
             if hasattr(self, 'active_connection'):

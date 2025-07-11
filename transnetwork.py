@@ -351,10 +351,19 @@ class TransNetwork:
         """Send input events to consumer."""
         try:
             event_msg = self.protocol.create_event_message(device_type, events)
-            sock.sendall(self.protocol.pack_message(event_msg))
+            data = self.protocol.pack_message(event_msg)
+            sock.sendall(data)
             return True
+        except socket.error as e:
+            # Socket errors usually indicate connection issues
+            import errno
+            if e.errno in (errno.ENOTCONN, errno.ECONNRESET, errno.EPIPE, errno.ECONNABORTED):
+                logger.error(f"Connection lost while sending events: {e}")
+            else:
+                logger.error(f"Socket error sending events: {e}")
+            return False
         except Exception as e:
-            print(f"Error sending events: {e}")
+            logger.error(f"Error sending events: {e}")
             return False
     
     # Consumer server methods
