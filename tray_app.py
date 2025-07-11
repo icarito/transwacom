@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+"""
+TransWacom - System Tray GUI Application
+Main GUI application with system tray interface for both Host and Consumer modes.
+"""
+import argparse
+import sys
+import time
+import threading
+import logging
+from typing import Dict, List, Optional, Callable, Any
+from pathlib import Path
+
+# GUI dependencies
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    from plyer import notification
+    GUI_AVAILABLE = True
+except ImportError:
+    pystray = None
+    Image = None
+    ImageDraw = None  
+    notification = None
+    GUI_AVAILABLE = False
+
+# TransWacom modules
+from device_detector import create_detector
+from config_manager import create_config_manager
+from transnetwork import create_network, DiscoveredConsumer
+from host_input import create_host_input_manager, InputEvent
+from consumer_device_emulation import create_device_emulation_manager
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+class TrayIcon:
+    """Base class for system tray icons."""
+    
+    def __init__(self):
+        self.icon = None
+        self.is_running = False
+        
+        if not GUI_AVAILABLE:
+            raise RuntimeError("GUI dependencies not available. Install with: pip install pystray Pillow plyer")
+        
+    def create_icon_image(self, color: str = "blue", status: str = "idle") -> Image.Image:
+        """Create a simple icon image."""
+        # Use a simple approach - create basic geometric shapes
+        image = Image.new('RGB', (64, 64), color=(240, 240, 240))
+        draw = ImageDraw.Draw(image)
+        
+        # Define colors
+        colors = {
+            "blue": (70, 130, 180),
+            "green": (60, 179, 113), 
+            "orange": (255, 140, 0),
+            "red": (220, 20, 60),
+            "gray": (128, 128, 128)
+        }
+        
+        main_color = colors.get(color, colors["blue"])
+        
+        # Draw main rectangle
+        draw.rectangle([8, 8, 56, 56], fill=main_color, outline=(50, 50, 50))
+        
+        # Draw "TW" text for TransWacom
+        try:
+            draw.text((20, 25), "TW", fill=(255, 255, 255))
+        except:
+            # Fallback if font issues
+            draw.rectangle([20, 25, 25, 35], fill=(255, 255, 255))
+            draw.rectangle([30, 25, 35, 35], fill=(255, 255, 255))
+        
+        # Draw status indicator
+        if status == "connected":
+            draw.ellipse([48, 8, 60, 20], fill=colors["green"])
+        elif status == "error":
+            draw.ellipse([48, 8, 60, 20], fill=colors["red"])
+        elif status == "available":
+            draw.ellipse([48, 8, 60, 20], fill=colors["orange"])
+            
+        return image
+    
+    def show_notification(self, title: str, message: str, timeout: int = 5):
+        """Show desktop notification."""
+        try:
+            notification.notify(
+                title=title,
+                message=message,
+                timeout=timeout,
+                app_name="TransWacom"
+            )
+        except Exception as e:
+            logger.error(f"Failed to show notification: {e}")
+    
+    def start(self):
+        """Start the tray icon."""
+        if self.icon:
+            self.is_running = True
+            self.icon.run()
+    
+    def stop(self):
+        """Stop the tray icon."""
+        self.is_running = False
+        if self.icon:
+            self.icon.stop()
+
+
+class HostTrayApp(TrayIcon):
+    """Host mode system tray application."""
+    
+    def __init__(self):
+        super().__init__()
+        self.config = create_config_manager()
+        self.detector = create_detector()
+        self.network = create_network()
+        self.input_manager = create_host_input_manager()
+        
+        # State
+        self.discovered_consumers: Dict[str, DiscoveredConsumer] = {}
+        self.active_connection = None
+        self.local_devices = []
+        
+        # Setup network discovery
+        self._setup_discovery()
+        
+        # Create tray icon
+        self._create_tray_icon()
+        
+        # Start device detection
+        self._update_devices()
+        
+    def _setup_discovery(self):
+        """Setup mDNS discovery for consumers."""
+        try:
+            def on_consumer_discovered(consumer: DiscoveredConsumer):
+                logger.info(f"Discovered consumer: {consumer.name} at {consumer.address}:{consumer.port}")
+                self.discovered_consumers[consumer.name] = consumer
+                self._update_menu()
+                
+            # Start discovery
+            success = self.network.discover_consumers(on_consumer_discovered)
+            if not success:
+                logger.warning("mDNS discovery not available")
+        except Exception as e:
+            logger.error(f"Failed to setup discovery: {e}")
+    
+    def _update_devices(self):
+        """Update the list of local devices."""
+        try:
+            self.local_devices = self.detector.detect_all_devices()
+            logger.info(f"Detected {len(self.local_devices)} local devices")
+            self._update_menu()
+        except Exception as e:
+            logger.error(f"Failed to detect devices: {e}")
+    
+    def _create_tray_icon(self):
+        """Create the system tray icon."""
+        image = self.create_icon_image("blue", "idle")
+        
+        self.icon = pystray.Icon(
+            "TransWacom Host",
+            image,
+            "TransWacom Host",
+            menu=self._create_menu()
+        )
+    
+    def _create_menu(self) -> pystray.Menu:
+        """Create the tray menu."""
+        try:
+            menu_items = []
+            
+            # Title
+            menu_items.append(pystray.MenuItem("🖊️ TransWacom Host", None, enabled=False))
+            menu_items.append(pystray.Menu.SEPARATOR)
+            
+            # Device status
+            if self.active_connection:
+                menu_items.append(pystray.MenuItem("📶 Estado: Conectado", None, enabled=False))
+            else:
+                menu_items.append(pystray.MenuItem("📶 Estado: Disponible", None, enabled=False))
+            
+            menu_items.append(pystray.Menu.SEPARATOR)
+            
+            # Devices section
+            menu_items.append(pystray.MenuItem("📱 Dispositivos Locales:", None, enabled=False))
+            if self.local_devices:
+                for i, device in enumerate(self.local_devices):
+                    if i >= 5:  # Limit to first 5 devices
+                        menu_items.append(pystray.MenuItem(f"  ... y {len(self.local_devices)-5} más", None, enabled=False))
+                        break
+                    status = "✓" if self.active_connection else "○"
+                    device_name = f"  {status} {device.name}"
+                    menu_items.append(pystray.MenuItem(device_name, None, enabled=False))
+            else:
+                menu_items.append(pystray.MenuItem("  No hay dispositivos", None, enabled=False))
+            
+            menu_items.append(pystray.Menu.SEPARATOR)
+            
+            # Consumer section  
+            menu_items.append(pystray.MenuItem("🌐 Consumers:", None, enabled=False))
+            if self.discovered_consumers:
+                for i, (consumer_name, consumer) in enumerate(self.discovered_consumers.items()):
+                    if i >= 3:  # Limit to first 3 consumers
+                        remaining = len(self.discovered_consumers) - 3
+                        menu_items.append(pystray.MenuItem(f"  ... y {remaining} más", None, enabled=False))
+                        break
+                    
+                    if self.local_devices and not self.active_connection:
+                        # Create connect action for first device
+                        device = self.local_devices[0]
+                        action = lambda d=device, c=consumer: self._connect_device_to_consumer(d, c)
+                        menu_items.append(pystray.MenuItem(f"  📺 Conectar a {consumer_name}", action))
+                    else:
+                        menu_items.append(pystray.MenuItem(f"  📺 {consumer_name}", None, enabled=False))
+            else:
+                menu_items.append(pystray.MenuItem("  Buscando...", None, enabled=False))
+            
+            menu_items.append(pystray.Menu.SEPARATOR)
+            
+            # Actions
+            if self.active_connection:
+                menu_items.append(pystray.MenuItem("❌ Desconectar", self._disconnect))
+            
+            menu_items.append(pystray.MenuItem("🔄 Actualizar", self._refresh_devices))
+            menu_items.append(pystray.MenuItem("⚙️ Configuración", self._open_config))
+            menu_items.append(pystray.MenuItem("❌ Salir", self._quit))
+            
+            return pystray.Menu(*menu_items)
+            
+        except Exception as e:
+            logger.error(f"Error creating menu: {e}")
+            # Fallback minimal menu
+            return pystray.Menu(
+                pystray.MenuItem("TransWacom Host", None, enabled=False),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Error en menú", None, enabled=False),
+                pystray.MenuItem("Salir", self._quit)
+            )
+    
+    def _create_consumer_submenu(self, consumer: DiscoveredConsumer) -> pystray.Menu:
+        """Create submenu for a specific consumer."""
+        submenu_items = []
+        
+        # Consumer info
+        submenu_items.append(pystray.MenuItem(f"📍 {consumer.address}:{consumer.port}", None, enabled=False))
+        submenu_items.append(pystray.MenuItem(f"🔧 {', '.join(consumer.capabilities)}", None, enabled=False))
+        submenu_items.append(pystray.Menu.SEPARATOR)
+        
+        # Connect actions for each device
+        if self.local_devices and not self.active_connection:
+            for device in self.local_devices:
+                action = lambda d=device, c=consumer: self._connect_device_to_consumer(d, c)
+                submenu_items.append(pystray.MenuItem(f"📱 Conectar {device.name}", action))
+        elif self.active_connection:
+            submenu_items.append(pystray.MenuItem("✓ Conectado", None, enabled=False))
+            submenu_items.append(pystray.MenuItem("❌ Desconectar", self._disconnect))
+        else:
+            submenu_items.append(pystray.MenuItem("No hay dispositivos disponibles", None, enabled=False))
+        
+        return pystray.Menu(*submenu_items)
+    
+    def _connect_device_to_consumer(self, device, consumer: DiscoveredConsumer):
+        """Connect a device to a consumer."""
+        def connect_async():
+            try:
+                logger.info(f"Connecting device {device.name} to consumer {consumer.name}")
+                
+                # Attempt connection using the simplified API
+                success = self._perform_connection(device, consumer)
+                
+                if success:
+                    self.active_connection = True  # Simplified state tracking
+                    self.show_notification(
+                        "Conexión Exitosa",
+                        f"{device.name} conectado a {consumer.name}"
+                    )
+                    # Update icon to show connected state
+                    self.icon.icon = self.create_icon_image("green", "connected")
+                else:
+                    self.show_notification(
+                        "Error de Conexión",
+                        f"No se pudo conectar {device.name} a {consumer.name}"
+                    )
+                
+                self._update_menu()
+                
+            except Exception as e:
+                logger.error(f"Connection error: {e}")
+                self.show_notification(
+                    "Error",
+                    f"Error al conectar: {str(e)}"
+                )
+        
+        # Run connection in background thread
+        threading.Thread(target=connect_async, daemon=True).start()
+    
+    def _perform_connection(self, device, consumer: DiscoveredConsumer) -> bool:
+        """Perform the actual connection to consumer."""
+        try:
+            # Prepare handshake data
+            handshake_data = self.network.protocol.create_handshake(
+                host_name=self.config.machine_name,
+                host_id=self.config.machine_id,
+                devices=[device.to_dict()]
+            )
+            
+            # Connect to consumer
+            connection = self.network.connect_to_consumer(
+                consumer.address, 
+                consumer.port,
+                handshake_data
+            )
+            
+            if connection:
+                # Start input capturing for this device
+                def event_callback(device_type: str, events):
+                    event_dicts = [event.to_dict() for event in events]
+                    self.network.send_events(connection, device_type, event_dicts)
+                
+                success = self.input_manager.start_capture(
+                    device.path,
+                    event_callback,
+                    self.config.should_use_relative_mode(),
+                    self.config.should_disable_local()
+                )
+                
+                return success
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Connection failed: {e}")
+            return False
+    
+    def _disconnect(self, icon, item):
+        """Disconnect from consumer."""
+        try:
+            if self.active_connection:
+                self.input_manager.stop_all_captures()
+                self.active_connection = None
+                self.icon.icon = self.create_icon_image("blue", "idle")
+                self.show_notification("TransWacom", "Desconectado")
+                self._update_menu()
+        except Exception as e:
+            logger.error(f"Disconnect error: {e}")
+    
+    def _refresh_devices(self, icon, item):
+        """Refresh device list."""
+        self._update_devices()
+        self.show_notification("TransWacom", "Lista de dispositivos actualizada")
+    
+    def _open_config(self, icon, item):
+        """Open configuration (placeholder)."""
+        self.show_notification("TransWacom", "Configuración: Funcionalidad próximamente")
+    
+    def _update_menu(self):
+        """Update the tray menu."""
+        if self.icon:
+            self.icon.menu = self._create_menu()
+    
+    def _quit(self, icon, item):
+        """Quit the application."""
+        if self.active_connection:
+            self._disconnect(icon, item)
+        self.stop()
+
+
+class ConsumerTrayApp(TrayIcon):
+    """Consumer mode system tray application."""
+    
+    def __init__(self):
+        super().__init__()
+        self.config = create_config_manager()
+        self.network = create_network()
+        self.device_manager = create_device_emulation_manager()
+        
+        # State
+        self.active_connections: List[str] = []
+        self.is_listening = False
+        self.port = self.config.get_consumer_port()
+        self.server_socket = None
+        
+        # Setup network server
+        self._setup_server()
+        
+        # Create tray icon
+        self._create_tray_icon()
+        
+        # Start mDNS advertising
+        self._start_advertising()
+        
+    def _setup_server(self):
+        """Setup TCP server for incoming connections."""
+        try:
+            def auth_callback(handshake: dict) -> bool:
+                """Handle incoming connection request."""
+                return self._handle_connection_request(handshake)
+            
+            def event_callback(device_type: str, events: list):
+                """Handle received input events."""
+                self._handle_events_received(device_type, events)
+            
+            self.server_socket = self.network.create_consumer_server(
+                self.port, 
+                auth_callback, 
+                event_callback
+            )
+            
+            self.is_listening = True
+            logger.info(f"Consumer server started on port {self.port}")
+            
+        except Exception as e:
+            logger.error(f"Failed to start server: {e}")
+    
+    def _start_advertising(self):
+        """Start mDNS advertising."""
+        try:
+            capabilities = []
+            consumer_config = self.config.config.get('consumer', {})
+            devices_config = consumer_config.get('devices', {})
+            
+            if devices_config.get('wacom_enabled', True):
+                capabilities.append('wacom')
+            if devices_config.get('joystick_enabled', True):
+                capabilities.append('joystick')
+            
+            mdns_name = self.config.get_mdns_name()
+            success = self.network.publish_consumer_service(
+                mdns_name,
+                self.port,
+                capabilities
+            )
+            
+            if success:
+                logger.info(f"Started advertising as '{mdns_name}' with capabilities: {capabilities}")
+            
+        except Exception as e:
+            logger.error(f"Failed to start advertising: {e}")
+    
+    def _handle_connection_request(self, handshake: dict) -> bool:
+        """Handle incoming connection request - show authorization dialog."""
+        host_name = handshake.get('host_name', 'Unknown')
+        host_id = handshake.get('host_id', '')
+        devices = handshake.get('devices', [])
+        
+        # Check if host is trusted
+        if self.config.is_host_trusted(host_name, host_id):
+            if self.config.should_auto_accept_host(host_name):
+                logger.info(f"Auto-accepting connection from trusted host: {host_name}")
+                self._add_connection(host_name)
+                return True
+        
+        # Show notification for authorization
+        device_names = [d.get('name', 'Unknown Device') for d in devices]
+        
+        self.show_notification(
+            "Nueva Conexión",
+            f"{host_name} quiere conectar: {', '.join(device_names)}",
+            timeout=15
+        )
+        
+        # For now, auto-accept (in real implementation, show dialog)
+        # TODO: Implement proper authorization dialog
+        logger.info(f"Connection request from {host_name} for devices: {device_names}")
+        self._add_connection(host_name)
+        return True
+    
+    def _add_connection(self, host_name: str):
+        """Add a connection to the active list."""
+        if host_name not in self.active_connections:
+            self.active_connections.append(host_name)
+            
+            self.show_notification(
+                "Conexión Establecida",
+                f"Conectado con {host_name}"
+            )
+            
+            # Update icon
+            self.icon.icon = self.create_icon_image("green", "connected")
+            self._update_menu()
+    
+    def _handle_events_received(self, device_type: str, events: list):
+        """Handle received input events."""
+        try:
+            # Process events through device manager
+            self.device_manager.process_events(device_type, events)
+        except Exception as e:
+            logger.error(f"Failed to process events: {e}")
+    
+    def _create_tray_icon(self):
+        """Create the system tray icon."""
+        status = "available" if self.is_listening else "error"
+        image = self.create_icon_image("blue", status)
+        
+        self.icon = pystray.Icon(
+            "TransWacom Consumer",
+            image,
+            "TransWacom Consumer",
+            menu=self._create_menu()
+        )
+    
+    def _create_menu(self) -> pystray.Menu:
+        """Create the tray menu."""
+        try:
+            menu_items = []
+            
+            # Title
+            menu_items.append(pystray.MenuItem("🖥️ TransWacom Consumer", None, enabled=False))
+            menu_items.append(pystray.Menu.SEPARATOR)
+            
+            # Status
+            if self.is_listening:
+                status_text = f"📶 Disponible (puerto {self.port})"
+            else:
+                status_text = "📶 Error - No escuchando"
+            menu_items.append(pystray.MenuItem(status_text, None, enabled=False))
+            
+            menu_items.append(pystray.Menu.SEPARATOR)
+            
+            # Active connections
+            if self.active_connections:
+                menu_items.append(pystray.MenuItem("🔗 Conexiones:", None, enabled=False))
+                for i, connection in enumerate(self.active_connections):
+                    if i >= 3:  # Limit display
+                        remaining = len(self.active_connections) - 3
+                        menu_items.append(pystray.MenuItem(f"  ... y {remaining} más", None, enabled=False))
+                        break
+                    connection_text = f"  📱 {connection}"
+                    menu_items.append(pystray.MenuItem(connection_text, None, enabled=False))
+            else:
+                menu_items.append(pystray.MenuItem("🔗 Sin conexiones", None, enabled=False))
+            
+            menu_items.append(pystray.Menu.SEPARATOR)
+            
+            # Actions
+            menu_items.append(pystray.MenuItem("⚙️ Configuración", self._open_config))
+            menu_items.append(pystray.MenuItem("❌ Salir", self._quit))
+            
+            return pystray.Menu(*menu_items)
+            
+        except Exception as e:
+            logger.error(f"Error creating consumer menu: {e}")
+            # Fallback minimal menu
+            return pystray.Menu(
+                pystray.MenuItem("TransWacom Consumer", None, enabled=False),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Error en menú", None, enabled=False),
+                pystray.MenuItem("Salir", self._quit)
+            )
+    
+    def _disconnect_host(self, host_name: str):
+        """Disconnect a specific host."""
+        try:
+            if host_name in self.active_connections:
+                self.active_connections.remove(host_name)
+                self.show_notification(
+                    "Desconexión",
+                    f"Desconectado de {host_name}"
+                )
+                
+                # Update icon
+                if not self.active_connections:
+                    self.icon.icon = self.create_icon_image("blue", "available")
+                
+                self._update_menu()
+        except Exception as e:
+            logger.error(f"Failed to disconnect host: {e}")
+    
+    def _open_config(self, icon, item):
+        """Open configuration (placeholder)."""
+        self.show_notification("TransWacom", "Configuración: Funcionalidad próximamente")
+    
+    def _update_menu(self):
+        """Update the tray menu."""
+        if self.icon:
+            self.icon.menu = self._create_menu()
+    
+    def _quit(self, icon, item):
+        """Quit the application."""
+        # Clean up connections
+        self.active_connections.clear()
+        
+        # Stop server
+        if self.server_socket:
+            self.server_socket.close()
+        
+        # Stop advertising
+        self.network.unpublish_consumer_service()
+        
+        self.stop()
+
+
+def main():
+    """Main entry point for the tray application."""
+    parser = argparse.ArgumentParser(description='TransWacom System Tray Application')
+    parser.add_argument('mode', choices=['host', 'consumer'], help='Operating mode')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+    
+    args = parser.parse_args()
+    
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    # Check GUI availability
+    if not GUI_AVAILABLE:
+        print("Error: GUI dependencies not available.")
+        print("Install with: pip install pystray Pillow plyer")
+        sys.exit(1)
+    
+    try:
+        if args.mode == 'host':
+            app = HostTrayApp()
+            logger.info("Starting TransWacom Host")
+        else:
+            app = ConsumerTrayApp()
+            logger.info("Starting TransWacom Consumer")
+        
+        # Start the application
+        logger.info("Starting system tray application...")
+        app.start()
+        
+    except KeyboardInterrupt:
+        logger.info("Application interrupted by user")
+    except Exception as e:
+        logger.error(f"Application error: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
