@@ -79,6 +79,7 @@ class WacomController:
         return None
     
     def disable_local_input(self) -> bool:
+        print(f"[WacomController] disable_local_input() called for {self.device_path}")
         """Disable tablet input on local system."""
         device_id = self.get_device_id()
         if not device_id:

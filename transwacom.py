@@ -2,6 +2,7 @@
 """
 TransWacom - Share input devices over network
 Refactored modular version using the new architecture.
+Supports both individual modes and unified GUI mode.
 """
 import argparse
 import sys
@@ -252,6 +253,295 @@ class TransWacomConsumer:
         self.network.shutdown()
         self.device_manager.destroy_all_devices()
         print("Service stopped")
+
+
+class TransWacomUnified:
+    """Unified implementation - both shares and receives devices."""
+    
+    def __init__(self):
+        self.config = create_config_manager()
+        self.detector = create_detector()
+        self.network = create_network()
+        self.input_manager = create_host_input_manager()
+        self.device_manager = create_device_emulation_manager()
+        
+        # State
+        self.discovered_consumers = {}
+        self.outgoing_connections = {}  # Connections we initiated
+        self.incoming_connections = []  # Connections to us
+        self.server_socket = None
+        
+    def start_service(self, port: Optional[int] = None):
+        """Start the unified service."""
+        if port is None:
+            port = self.config.get_consumer_port()
+        
+        print("Starting TransWacom unified service...")
+        print("This agent can both share and receive devices.")
+        
+        # Start server (consumer functionality)
+        def auth_callback(handshake: dict) -> bool:
+            host_name = handshake.get('host_name', 'Unknown')
+            host_id = handshake.get('host_id', '')
+            devices = handshake.get('devices', [])
+            
+            device_names = [d.get('name', 'Unknown Device') for d in devices]
+            print(f"\nIncoming connection from: {host_name}")
+            print(f"Wants to share: {', '.join(device_names)}")
+            
+            # Check if host is trusted
+            if self.config.is_host_trusted(host_name, host_id):
+                if self.config.should_auto_accept_host(host_name):
+                    print("Auto-accepting trusted host")
+                    self._add_incoming_connection(host_name)
+                    return True
+            
+            # Interactive authorization
+            try:
+                response = input("Accept connection? [y/N/t(rust)]: ").lower()
+                if response == 't':
+                    self.config.add_trusted_host(host_name, host_id, auto_accept=True)
+                    print(f"Added {host_name} to trusted hosts")
+                    self._add_incoming_connection(host_name)
+                    return True
+                elif response == 'y':
+                    self._add_incoming_connection(host_name)
+                    return True
+                else:
+                    print("Connection rejected")
+                    return False
+            except KeyboardInterrupt:
+                print("Connection rejected")
+                return False
+        
+        def event_callback(device_type: str, events: list):
+            self.device_manager.process_events(device_type, events)
+        
+        # Start server
+        self.server_socket = self.network.create_consumer_server(port, auth_callback, event_callback)
+        
+        # Start mDNS advertising
+        capabilities = self.device_manager.get_capabilities()
+        mdns_name = self.config.get_mdns_name()
+        self.network.publish_consumer_service(mdns_name, port, capabilities)
+        
+        print(f"Server started on port {port}")
+        print(f"mDNS name: {mdns_name}")
+        print(f"Capabilities: {', '.join(capabilities)}")
+        print("\nCommands:")
+        print("  discover    - Discover other consumers")
+        print("  devices     - List local devices")
+        print("  connect     - Connect a device to a consumer")
+        print("  status      - Show connection status")
+        print("  quit        - Exit")
+        
+        # Start discovery
+        self._start_discovery()
+        
+        # Interactive loop
+        try:
+            while True:
+                try:
+                    command = input("\n> ").strip().lower()
+                    if command == "discover":
+                        self._run_discovery()
+                    elif command == "devices":
+                        self._list_devices()
+                    elif command == "connect":
+                        self._interactive_connect()
+                    elif command == "status":
+                        self._show_status()
+                    elif command in ["quit", "exit"]:
+                        break
+                    elif command == "help":
+                        print("Commands: discover, devices, connect, status, quit")
+                    else:
+                        print("Unknown command. Type 'help' for available commands.")
+                except EOFError:
+                    break
+        except KeyboardInterrupt:
+            print("\nShutting down...")
+        finally:
+            self.stop_service()
+    
+    def _start_discovery(self):
+        """Start background discovery."""
+        def on_discovery(consumer: DiscoveredConsumer):
+            # Filter out ourselves
+            if consumer.address == "127.0.0.1" and consumer.port == self.config.get_consumer_port():
+                return
+            self.discovered_consumers[consumer.unique_id] = consumer
+        
+        self.network.discover_consumers(on_discovery)
+    
+    def _run_discovery(self):
+        """Run discovery and show results."""
+        print("Discovering consumers for 5 seconds...")
+        self.discovered_consumers.clear()
+        self._start_discovery()
+        time.sleep(5)
+        
+        if self.discovered_consumers:
+            print(f"\nFound {len(self.discovered_consumers)} consumers:")
+            for i, consumer in enumerate(self.discovered_consumers.values()):
+                print(f"  {i+1}. {consumer.name} at {consumer.address}:{consumer.port}")
+                print(f"     Capabilities: {', '.join(consumer.capabilities)}")
+        else:
+            print("No consumers found")
+    
+    def _list_devices(self):
+        """List local devices."""
+        devices = self.detector.detect_all_devices()
+        print(f"\nLocal devices ({len(devices)}):")
+        if not devices:
+            print("  No devices found")
+        else:
+            for i, device in enumerate(devices):
+                status = ""
+                for conn_info in self.outgoing_connections.values():
+                    if conn_info.get('device_path') == device.path:
+                        status = f" (sharing with {conn_info['consumer_name']})"
+                        break
+                print(f"  {i+1}. {device}{status}")
+    
+    def _interactive_connect(self):
+        """Interactive connection setup."""
+        # List devices
+        devices = self.detector.detect_all_devices()
+        if not devices:
+            print("No local devices available")
+            return
+        
+        # List consumers
+        if not self.discovered_consumers:
+            print("No consumers discovered. Run 'discover' first.")
+            return
+        
+        print("\nAvailable devices:")
+        for i, device in enumerate(devices):
+            print(f"  {i+1}. {device}")
+        
+        print("\nAvailable consumers:")
+        consumers = list(self.discovered_consumers.values())
+        for i, consumer in enumerate(consumers):
+            print(f"  {i+1}. {consumer.name}")
+        
+        try:
+            device_choice = int(input("Select device (number): ")) - 1
+            consumer_choice = int(input("Select consumer (number): ")) - 1
+            
+            if 0 <= device_choice < len(devices) and 0 <= consumer_choice < len(consumers):
+                device = devices[device_choice]
+                consumer = consumers[consumer_choice]
+                self._connect_device_to_consumer(device, consumer)
+            else:
+                print("Invalid selection")
+        except (ValueError, KeyboardInterrupt):
+            print("Cancelled")
+    
+    def _connect_device_to_consumer(self, device, consumer):
+        """Connect a device to a consumer."""
+        print(f"Connecting {device.name} to {consumer.name}...")
+        
+        # Prepare handshake
+        handshake_data = self.network.protocol.create_handshake(
+            host_name=self.config.machine_name,
+            host_id=self.config.machine_id,
+            devices=[device.to_dict()]
+        )
+        
+        # Connect
+        connection = self.network.connect_to_consumer(
+            consumer.address, 
+            consumer.port,
+            handshake_data
+        )
+        
+        if connection:
+            # Store connection
+            self.outgoing_connections[consumer.unique_id] = {
+                'connection': connection,
+                'consumer': consumer,
+                'device': device,
+                'device_path': device.path,
+                'consumer_name': consumer.name
+            }
+            
+            # Start input capture
+            def event_callback(device_type: str, events):
+                if consumer.unique_id in self.outgoing_connections:
+                    event_dicts = [event.to_dict() for event in events]
+                    success = self.network.send_events(connection, device_type, event_dicts)
+                    if not success:
+                        print(f"Lost connection to {consumer.name}")
+                        self._disconnect_outgoing(consumer.unique_id)
+            
+            relative_mode = self.config.should_use_relative_mode()
+            disable_local = self.config.should_disable_local()
+            
+            success = self.input_manager.start_capture(
+                device.path, event_callback, relative_mode, disable_local
+            )
+            
+            if success:
+                print(f"Successfully connected {device.name} to {consumer.name}")
+            else:
+                print("Failed to start input capture")
+                self.network.disconnect_from_consumer(connection)
+                del self.outgoing_connections[consumer.unique_id]
+        else:
+            print("Connection failed")
+    
+    def _disconnect_outgoing(self, consumer_id):
+        """Disconnect an outgoing connection."""
+        if consumer_id in self.outgoing_connections:
+            info = self.outgoing_connections[consumer_id]
+            self.input_manager.stop_capture(info['device_path'])
+            self.network.disconnect_from_consumer(info['connection'])
+            del self.outgoing_connections[consumer_id]
+            print(f"Disconnected from {info['consumer_name']}")
+    
+    def _add_incoming_connection(self, host_name):
+        """Add an incoming connection."""
+        if host_name not in self.incoming_connections:
+            self.incoming_connections.append(host_name)
+            print(f"Now receiving devices from {host_name}")
+    
+    def _show_status(self):
+        """Show connection status."""
+        print(f"\nStatus:")
+        print(f"  Outgoing connections: {len(self.outgoing_connections)}")
+        for info in self.outgoing_connections.values():
+            print(f"    Sharing {info['device'].name} with {info['consumer_name']}")
+        
+        print(f"  Incoming connections: {len(self.incoming_connections)}")
+        for host in self.incoming_connections:
+            print(f"    Receiving from {host}")
+        
+        print(f"  Discovered consumers: {len(self.discovered_consumers)}")
+    
+    def stop_service(self):
+        """Stop the service."""
+        # Disconnect all outgoing connections
+        for consumer_id in list(self.outgoing_connections.keys()):
+            self._disconnect_outgoing(consumer_id)
+        
+        # Stop all captures
+        self.input_manager.stop_all_captures()
+        
+        # Stop server
+        if self.server_socket:
+            self.server_socket.close()
+        
+        # Stop advertising
+        self.network.unpublish_consumer_service()
+        
+        # Stop discovery
+        self.network.stop_discovery()
+        
+        print("Service stopped")
+
+
 def main():
     """Main entry point with refactored modular architecture."""
     parser = argparse.ArgumentParser(
@@ -263,6 +553,10 @@ def main():
                        help='Host mode: capture and send device events')
     parser.add_argument('--consumer', action='store_true',
                        help='Consumer mode: receive events and create virtual devices')
+    parser.add_argument('--unified', action='store_true',
+                       help='Unified mode: both share and receive devices')
+    parser.add_argument('--applet', action='store_true',
+                       help='Lanzar el applet de bandeja unificado (GUI)')
     
     # Discovery and connection
     parser.add_argument('--discover', action='store_true',
@@ -301,11 +595,11 @@ def main():
         args.consumer = True
     
     # Validate arguments
-    if args.host and args.consumer:
-        print("Error: Cannot specify both --host and --consumer modes")
+    if sum([args.host, args.consumer, args.unified, args.applet]) > 1:
+        print("Error: Cannot specify multiple modes")
         sys.exit(1)
-    
-    if not args.host and not args.consumer:
+
+    if not any([args.host, args.consumer, args.unified, args.applet]):
         if args.list_devices:
             # Allow listing devices without mode selection
             detector = create_detector()
@@ -320,19 +614,26 @@ def main():
                         print(f"    Capabilities: {', '.join(device.capabilities)}")
             return
         else:
-            print("Error: Must specify either --host or --consumer mode")
-            parser.print_help()
-            sys.exit(1)
-    
+            # Default to unified mode
+            args.unified = True
+
+    # Llamar al applet si se pasa --applet
+    if args.applet:
+        from tray_app_unified import main as tray_main
+        tray_main()
+        return
+
     try:
-        if args.host:
+        if args.unified:
+            # Unified mode
+            unified = TransWacomUnified()
+            unified.start_service(args.port)
+        elif args.host:
             # Host mode
             host = TransWacomHost()
-            
             if args.list_devices:
                 host.list_devices()
                 return
-            
             if args.discover:
                 host.run_discovery()
             elif args.connect:
@@ -347,7 +648,6 @@ def main():
                 except ValueError:
                     print("Error: Invalid address format. Use ADDRESS:PORT")
                     sys.exit(1)
-                
                 # Select device
                 if args.device:
                     device_path = args.device
@@ -358,7 +658,6 @@ def main():
                         sys.exit(1)
                     device_path = devices[0].path
                     print(f"Auto-selected device: {devices[0].name} ({device_path})")
-                
                 # Connect
                 success = host.connect_to_consumer(address, port, device_path)
                 if success:
@@ -374,12 +673,14 @@ def main():
             else:
                 print("Host mode: use --discover for discovery or --connect ADDRESS:PORT")
                 parser.print_help()
-        
         elif args.consumer:
             # Consumer mode
             consumer = TransWacomConsumer()
             consumer.start_service(args.port)
-    
+        elif args.unified:
+            # Unified mode
+            unified = TransWacomUnified()
+            unified.start_service(args.port)
     except KeyboardInterrupt:
         print("\nShutting down...")
     except Exception as e:

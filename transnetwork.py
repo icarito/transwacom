@@ -32,6 +32,11 @@ class DiscoveredConsumer:
     capabilities: List[str]
     version: str
 
+    @property
+    def unique_id(self):
+        # Use address:port as unique id (suficiente para la app)
+        return f"{self.address}:{self.port}"
+
 
 @dataclass
 class ConnectionInfo:
@@ -161,6 +166,7 @@ class TransNetwork:
         self.service_browser = None
         self.listener = None
         self.active_connections = {}
+        self.incoming_sockets = {}  # key: host_name, value: socket
         
     def __enter__(self):
         return self
@@ -375,24 +381,23 @@ class TransNetwork:
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_sock.bind(('0.0.0.0', port))
         server_sock.listen(5)
-        
+
         def handle_client(client_sock, client_addr):
             """Handle individual client connection."""
+            host_name = None
             try:
                 client_protocol = NetworkProtocol()
-                
+                handshake_done = False
                 while True:
                     data = client_sock.recv(1024)
                     if not data:
                         break
-                    
                     messages = client_protocol.unpack_messages(data)
-                    
                     for message in messages:
                         msg_type = message.get('type')
-                        
                         if msg_type == 'handshake':
                             # Handle authorization
+                            host_name = message.get('host_name', str(client_addr))
                             accepted = auth_callback(message)
                             auth_response = self.protocol.create_auth_response(
                                 accepted, 
@@ -400,50 +405,64 @@ class TransNetwork:
                                 "consumer_id_placeholder"  # Should come from config
                             )
                             client_sock.sendall(self.protocol.pack_message(auth_response))
-                            
-                            if not accepted:
+                            if accepted:
+                                # Guardar el socket para desconexión futura
+                                self.incoming_sockets[host_name] = client_sock
+                                handshake_done = True
+                            else:
                                 client_sock.close()
                                 return
-                                
                         elif msg_type == 'event':
-                            # Handle input events
                             device_type = message.get('device_type')
                             events = message.get('events', [])
                             event_callback(device_type, events)
-                            
                         elif msg_type == 'disconnect':
                             print(f"Client {client_addr} disconnected: {message.get('reason')}")
                             break
-                            
+                
             except Exception as e:
                 print(f"Error handling client {client_addr}: {e}")
             finally:
+                # Limpiar socket de la lista si estaba registrado
+                if host_name and host_name in self.incoming_sockets and self.incoming_sockets[host_name] is client_sock:
+                    del self.incoming_sockets[host_name]
                 client_sock.close()
-        
+
         def accept_connections():
             """Accept and handle incoming connections."""
             while True:
                 try:
                     client_sock, client_addr = server_sock.accept()
                     print(f"New connection from {client_addr}")
-                    
-                    # Handle client in separate thread
                     client_thread = threading.Thread(
                         target=handle_client,
                         args=(client_sock, client_addr),
                         daemon=True
                     )
                     client_thread.start()
-                    
                 except Exception as e:
                     print(f"Error accepting connection: {e}")
                     break
-        
-        # Start accepting connections in background thread
+
         accept_thread = threading.Thread(target=accept_connections, daemon=True)
         accept_thread.start()
-        
         return server_sock
+    def disconnect_incoming_host(self, host_name: str):
+        """Disconnect a specific incoming host by host_name."""
+        sock = self.incoming_sockets.get(host_name)
+        if sock:
+            try:
+                # Enviar mensaje de desconexión si es posible
+                try:
+                    disconnect_msg = self.protocol.create_disconnect_message('user_request')
+                    sock.sendall(self.protocol.pack_message(disconnect_msg))
+                except Exception:
+                    pass
+                sock.close()
+            except Exception as e:
+                print(f"Error disconnecting incoming host {host_name}: {e}")
+            finally:
+                del self.incoming_sockets[host_name]
     
     def get_active_connections(self) -> List[ConnectionInfo]:
         """Get list of active connections."""
