@@ -5,8 +5,12 @@ import json
 import socket
 import threading
 import time
+import logging
 from typing import Dict, List, Optional, Callable, Any
 from dataclasses import dataclass
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 try:
     from zeroconf import ServiceInfo, Zeroconf, ServiceBrowser, ServiceListener
@@ -220,7 +224,7 @@ class TransNetwork:
             
             # Get real local IP (not loopback)
             local_ip = self._get_local_ip()
-            print(f"Publishing mDNS service on IP: {local_ip}")
+            logger.debug(f"Publishing mDNS service on IP: {local_ip}")
             
             # Create service info
             service_name = f"{name}.{self.SERVICE_TYPE}"
@@ -237,7 +241,7 @@ class TransNetwork:
             )
             
             self.zeroconf.register_service(self.service_info)
-            print(f"Published mDNS service: {service_name} on {local_ip}:{port}")
+            logger.info(f"Published mDNS service: {service_name} on {local_ip}:{port}")
             return True
             
         except Exception as e:
@@ -249,9 +253,9 @@ class TransNetwork:
         if self.zeroconf and self.service_info:
             try:
                 self.zeroconf.unregister_service(self.service_info)
-                print("Unpublished mDNS service")
+                logger.info("Unpublished mDNS service")
             except Exception as e:
-                print(f"Error unpublishing service: {e}")
+                logger.error(f"Error unpublishing service: {e}")
     
     # Host methods (client side)
     def discover_consumers(self, discovery_callback: Callable[[DiscoveredConsumer], None]) -> bool:
@@ -482,25 +486,50 @@ class TransNetwork:
         
         return server_socket
     
-    def connect_to_consumer(self, address: str, port: int, device_info: Dict[str, Any]) -> Optional[Any]:
-        """Connect to consumer with device info."""
-        # Create handshake data
-        handshake_data = {
-            'type': 'handshake',
-            'host_name': socket.gethostname(),
-            'host_id': 'host_id_placeholder',
-            'devices': [device_info],
-            'version': '1.0'
-        }
-        
-        return self.connect_to_consumer(address, port, handshake_data)
-    
-    def send_events(self, connection, events: List[Dict[str, Any]]) -> bool:
-        """Send events through connection."""
-        if hasattr(connection, 'sendall'):
-            device_type = events[0].get('device_type', 'unknown') if events else 'unknown'
-            return self.send_events(connection, device_type, events)
-        return False
+    def connect_to_consumer(self, address: str, port: int, handshake_data: Dict[str, Any]) -> Optional[socket.socket]:
+        """Connect to a consumer with proper handshake data."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(60)  # 60 second timeout for user authorization
+            sock.connect((address, port))
+            
+            print("Connected to consumer, sending handshake...")
+            # Send handshake
+            handshake_msg = self.protocol.pack_message(handshake_data)
+            sock.sendall(handshake_msg)
+            
+            print("Waiting for authorization response...")
+            # Wait for auth response with longer timeout
+            response_data = sock.recv(1024)
+            messages = self.protocol.unpack_messages(response_data)
+            
+            if messages and messages[0].get('type') == 'auth_response':
+                auth_response = messages[0]
+                if auth_response.get('accepted'):
+                    # Connection accepted
+                    connection_info = ConnectionInfo(
+                        address=address,
+                        port=port,
+                        host_name=handshake_data['host_name'],
+                        consumer_name=auth_response.get('consumer_name', 'Unknown'),
+                        devices=handshake_data['devices'],
+                        connected_at=time.time()
+                    )
+                    self.active_connections[f"{address}:{port}"] = connection_info
+                    print(f"Connected to {auth_response.get('consumer_name')} at {address}:{port}")
+                    return sock
+                else:
+                    print("Connection rejected by consumer")
+                    sock.close()
+                    return None
+            else:
+                print("Invalid handshake response")
+                sock.close()
+                return None
+                
+        except Exception as e:
+            print(f"Connection failed: {e}")
+            return None
     
     def disconnect_host(self, connection_id: str):
         """Disconnect a specific host by connection ID."""

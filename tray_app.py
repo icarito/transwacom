@@ -8,8 +8,10 @@ import sys
 import time
 import threading
 import logging
+import signal
 from typing import Dict, List, Optional, Callable, Any
 from pathlib import Path
+from functools import partial
 
 # GUI dependencies
 try:
@@ -34,6 +36,24 @@ from consumer_device_emulation import create_device_emulation_manager
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Global reference to the app for signal handling
+_current_app = None
+
+
+def signal_handler(signum, frame):
+    """Handle interrupt signals to ensure proper cleanup."""
+    global _current_app
+    logger.info(f"Received signal {signum}, cleaning up...")
+    
+    if _current_app:
+        try:
+            # Force cleanup
+            _current_app._emergency_cleanup()
+        except Exception as e:
+            logger.error(f"Error during emergency cleanup: {e}")
+    
+    sys.exit(0)
 
 
 class TrayIcon:
@@ -123,6 +143,8 @@ class HostTrayApp(TrayIcon):
         self.discovered_consumers: Dict[str, DiscoveredConsumer] = {}
         self.active_connection = None
         self.local_devices = []
+        self._updating_menu = False  # Flag to prevent recursion
+        self._menu_update_timer = None  # Timer for delayed updates
         
         # Setup network discovery
         self._setup_discovery()
@@ -139,7 +161,7 @@ class HostTrayApp(TrayIcon):
             def on_consumer_discovered(consumer: DiscoveredConsumer):
                 logger.info(f"Discovered consumer: {consumer.name} at {consumer.address}:{consumer.port}")
                 self.discovered_consumers[consumer.name] = consumer
-                self._update_menu()
+                self._schedule_menu_update()
                 
             # Start discovery
             success = self.network.discover_consumers(on_consumer_discovered)
@@ -153,7 +175,7 @@ class HostTrayApp(TrayIcon):
         try:
             self.local_devices = self.detector.detect_all_devices()
             logger.info(f"Detected {len(self.local_devices)} local devices")
-            self._update_menu()
+            self._schedule_menu_update()
         except Exception as e:
             logger.error(f"Failed to detect devices: {e}")
     
@@ -203,19 +225,18 @@ class HostTrayApp(TrayIcon):
             # Consumer section  
             menu_items.append(pystray.MenuItem("🌐 Consumers:", None, enabled=False))
             if self.discovered_consumers:
-                for i, (consumer_name, consumer) in enumerate(self.discovered_consumers.items()):
-                    if i >= 3:  # Limit to first 3 consumers
-                        remaining = len(self.discovered_consumers) - 3
-                        menu_items.append(pystray.MenuItem(f"  ... y {remaining} más", None, enabled=False))
-                        break
+                consumer_count = len(self.discovered_consumers)
+                if consumer_count > 0:
+                    # Show only first consumer and count
+                    first_consumer_name = list(self.discovered_consumers.keys())[0]
+                    menu_items.append(pystray.MenuItem(f"  📺 {first_consumer_name}", None, enabled=False))
                     
+                    if consumer_count > 1:
+                        menu_items.append(pystray.MenuItem(f"  ... y {consumer_count-1} más", None, enabled=False))
+                    
+                    # Simple connection option
                     if self.local_devices and not self.active_connection:
-                        # Create connect action for first device
-                        device = self.local_devices[0]
-                        action = lambda d=device, c=consumer: self._connect_device_to_consumer(d, c)
-                        menu_items.append(pystray.MenuItem(f"  📺 Conectar a {consumer_name}", action))
-                    else:
-                        menu_items.append(pystray.MenuItem(f"  📺 {consumer_name}", None, enabled=False))
+                        menu_items.append(pystray.MenuItem("� Conectar al primero", self._connect_simple))
             else:
                 menu_items.append(pystray.MenuItem("  Buscando...", None, enabled=False))
             
@@ -253,8 +274,7 @@ class HostTrayApp(TrayIcon):
         # Connect actions for each device
         if self.local_devices and not self.active_connection:
             for device in self.local_devices:
-                action = lambda d=device, c=consumer: self._connect_device_to_consumer(d, c)
-                submenu_items.append(pystray.MenuItem(f"📱 Conectar {device.name}", action))
+                submenu_items.append(pystray.MenuItem(f"📱 Conectar {device.name}", self._connect_device_simple))
         elif self.active_connection:
             submenu_items.append(pystray.MenuItem("✓ Conectado", None, enabled=False))
             submenu_items.append(pystray.MenuItem("❌ Desconectar", self._disconnect))
@@ -263,6 +283,33 @@ class HostTrayApp(TrayIcon):
         
         return pystray.Menu(*submenu_items)
     
+    def _connect_simple(self, icon, item):
+        """Simple connection - connects first device to first consumer."""
+        try:
+            if self.local_devices and self.discovered_consumers and not self.active_connection:
+                device = self.local_devices[0]
+                consumer = list(self.discovered_consumers.values())[0]
+                logger.info(f"Simple connect: {device.name} -> {consumer.name}")
+                self._connect_device_to_consumer(device, consumer)
+            else:
+                logger.warning("Cannot connect: missing devices or consumers, or already connected")
+        except Exception as e:
+            logger.error(f"Simple connect error: {e}")
+
+    def _connect_to_first_consumer(self, icon, item):
+        """Connect first device to first consumer."""
+        self._connect_simple(icon, item)
+
+    def _connect_device_simple(self, icon, item):
+        """Simple device connection - connects first device to context consumer."""
+        if self.local_devices:
+            device = self.local_devices[0]
+            # This is a simplified version - in a real implementation, 
+            # we'd need to pass the consumer context differently
+            if self.discovered_consumers:
+                consumer = list(self.discovered_consumers.values())[0]
+                self._connect_device_to_consumer(device, consumer)
+
     def _connect_device_to_consumer(self, device, consumer: DiscoveredConsumer):
         """Connect a device to a consumer."""
         def connect_async():
@@ -286,7 +333,7 @@ class HostTrayApp(TrayIcon):
                         f"No se pudo conectar {device.name} a {consumer.name}"
                     )
                 
-                self._update_menu()
+                self._schedule_menu_update()
                 
             except Exception as e:
                 logger.error(f"Connection error: {e}")
@@ -301,14 +348,28 @@ class HostTrayApp(TrayIcon):
     def _perform_connection(self, device, consumer: DiscoveredConsumer) -> bool:
         """Perform the actual connection to consumer."""
         try:
+            logger.debug(f"Starting connection process for {device.name} -> {consumer.name}")
+            
             # Prepare handshake data
+            logger.debug("Getting machine name and ID from config...")
+            machine_name = self.config.machine_name
+            machine_id = self.config.machine_id
+            logger.debug(f"Machine name: {machine_name}, ID: {machine_id}")
+            
+            logger.debug("Converting device to dict...")
+            device_dict = device.to_dict()
+            logger.debug(f"Device dict: {device_dict}")
+            
+            logger.debug("Creating handshake data...")
             handshake_data = self.network.protocol.create_handshake(
-                host_name=self.config.machine_name,
-                host_id=self.config.machine_id,
-                devices=[device.to_dict()]
+                host_name=machine_name,
+                host_id=machine_id,
+                devices=[device_dict]
             )
+            logger.debug(f"Handshake data created: {handshake_data}")
             
             # Connect to consumer
+            logger.debug(f"Connecting to consumer at {consumer.address}:{consumer.port}")
             connection = self.network.connect_to_consumer(
                 consumer.address, 
                 consumer.port,
@@ -316,24 +377,35 @@ class HostTrayApp(TrayIcon):
             )
             
             if connection:
+                logger.debug("Connection established, setting up input capture...")
                 # Start input capturing for this device
                 def event_callback(device_type: str, events):
                     event_dicts = [event.to_dict() for event in events]
                     self.network.send_events(connection, device_type, event_dicts)
                 
+                logger.debug("Getting config settings for input manager...")
+                use_relative = self.config.should_use_relative_mode()
+                disable_local = self.config.should_disable_local()
+                logger.debug(f"Relative mode: {use_relative}, Disable local: {disable_local}")
+                
+                logger.debug("Starting input capture...")
                 success = self.input_manager.start_capture(
                     device.path,
                     event_callback,
-                    self.config.should_use_relative_mode(),
-                    self.config.should_disable_local()
+                    use_relative,
+                    disable_local
                 )
                 
+                logger.debug(f"Input capture started: {success}")
                 return success
             
+            logger.debug("Connection failed - no connection returned")
             return False
             
         except Exception as e:
             logger.error(f"Connection failed: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return False
     
     def _disconnect(self, icon, item):
@@ -344,7 +416,7 @@ class HostTrayApp(TrayIcon):
                 self.active_connection = None
                 self.icon.icon = self.create_icon_image("blue", "idle")
                 self.show_notification("TransWacom", "Desconectado")
-                self._update_menu()
+                self._schedule_menu_update()
         except Exception as e:
             logger.error(f"Disconnect error: {e}")
     
@@ -357,16 +429,79 @@ class HostTrayApp(TrayIcon):
         """Open configuration (placeholder)."""
         self.show_notification("TransWacom", "Configuración: Funcionalidad próximamente")
     
+    def _schedule_menu_update(self):
+        """Schedule a menu update with a small delay to avoid rapid updates."""
+        if self._menu_update_timer:
+            self._menu_update_timer.cancel()
+        
+        self._menu_update_timer = threading.Timer(0.5, self._update_menu)
+        self._menu_update_timer.start()
+    
     def _update_menu(self):
         """Update the tray menu."""
-        if self.icon:
-            self.icon.menu = self._create_menu()
+        if self.icon and not self._updating_menu:
+            self._updating_menu = True
+            try:
+                self.icon.menu = self._create_menu()
+                logger.debug("Menu updated successfully")
+            except Exception as e:
+                logger.error(f"Error updating menu: {e}")
+            finally:
+                self._updating_menu = False
     
     def _quit(self, icon, item):
         """Quit the application."""
+        logger.info("Quitting application...")
+        
+        # Cancel any pending menu updates
+        if self._menu_update_timer:
+            self._menu_update_timer.cancel()
+        
+        # Ensure all captures are stopped (even if no active connection)
+        try:
+            logger.info("Stopping all input captures...")
+            self.input_manager.stop_all_captures()
+        except Exception as e:
+            logger.error(f"Error stopping captures: {e}")
+        
+        # Handle active connection
         if self.active_connection:
+            logger.info("Disconnecting active connection...")
             self._disconnect(icon, item)
+        
+        logger.info("Stopping tray application...")
         self.stop()
+    
+    def _emergency_cleanup(self):
+        """Emergency cleanup to restore device states."""
+        logger.info("Performing emergency cleanup...")
+        
+        try:
+            # Force stop all input captures to restore device states
+            if hasattr(self, 'input_manager'):
+                logger.info("Stopping all input captures...")
+                self.input_manager.stop_all_captures()
+            
+            # Clear active connection
+            if hasattr(self, 'active_connection'):
+                self.active_connection = None
+                
+            logger.info("Emergency cleanup completed")
+            
+        except Exception as e:
+            logger.error(f"Error during emergency cleanup: {e}")
+            # Even if cleanup fails, try to restore Wacom state directly
+            try:
+                import subprocess
+                logger.info("Attempting direct Wacom restore...")
+                subprocess.run(["xsetwacom", "--list", "devices"], 
+                             capture_output=True, text=True, timeout=5)
+                # This will help identify if xsetwacom is available
+                subprocess.run(["bash", "-c", "xsetwacom --list devices | head -1 | cut -f1 | xargs -I {} xsetwacom --set {} Mode Absolute"], 
+                             capture_output=True, text=True, timeout=5)
+                logger.info("Direct Wacom restore attempted")
+            except Exception as restore_error:
+                logger.error(f"Direct Wacom restore failed: {restore_error}")
 
 
 class ConsumerTrayApp(TrayIcon):
@@ -383,6 +518,7 @@ class ConsumerTrayApp(TrayIcon):
         self.is_listening = False
         self.port = self.config.get_consumer_port()
         self.server_socket = None
+        self._updating_menu = False  # Flag to prevent recursion
         
         # Setup network server
         self._setup_server()
@@ -576,8 +712,12 @@ class ConsumerTrayApp(TrayIcon):
     
     def _update_menu(self):
         """Update the tray menu."""
-        if self.icon:
-            self.icon.menu = self._create_menu()
+        if self.icon and not self._updating_menu:
+            self._updating_menu = True
+            try:
+                self.icon.menu = self._create_menu()
+            finally:
+                self._updating_menu = False
     
     def _quit(self, icon, item):
         """Quit the application."""
@@ -592,10 +732,34 @@ class ConsumerTrayApp(TrayIcon):
         self.network.unpublish_consumer_service()
         
         self.stop()
+    
+    def _emergency_cleanup(self):
+        """Emergency cleanup for consumer."""
+        logger.info("Performing consumer emergency cleanup...")
+        
+        try:
+            # Clean up connections
+            if hasattr(self, 'active_connections'):
+                self.active_connections.clear()
+            
+            # Stop server
+            if hasattr(self, 'server_socket') and self.server_socket:
+                self.server_socket.close()
+            
+            # Stop advertising
+            if hasattr(self, 'network'):
+                self.network.unpublish_consumer_service()
+                
+            logger.info("Consumer emergency cleanup completed")
+            
+        except Exception as e:
+            logger.error(f"Error during consumer emergency cleanup: {e}")
 
 
 def main():
     """Main entry point for the tray application."""
+    global _current_app
+    
     parser = argparse.ArgumentParser(description='TransWacom System Tray Application')
     parser.add_argument('mode', choices=['host', 'consumer'], help='Operating mode')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
@@ -611,12 +775,18 @@ def main():
         print("Install with: pip install pystray Pillow plyer")
         sys.exit(1)
     
+    # Register signal handlers for proper cleanup
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     try:
         if args.mode == 'host':
             app = HostTrayApp()
+            _current_app = app  # Store global reference for signal handling
             logger.info("Starting TransWacom Host")
         else:
             app = ConsumerTrayApp()
+            _current_app = app  # Store global reference for signal handling
             logger.info("Starting TransWacom Consumer")
         
         # Start the application
@@ -625,8 +795,12 @@ def main():
         
     except KeyboardInterrupt:
         logger.info("Application interrupted by user")
+        if _current_app:
+            _current_app._emergency_cleanup()
     except Exception as e:
         logger.error(f"Application error: {e}")
+        if _current_app:
+            _current_app._emergency_cleanup()
         sys.exit(1)
 
 

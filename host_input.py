@@ -168,11 +168,11 @@ class WacomController:
         
         try:
             result = subprocess.run(
-                ["xsetwacom", "--set", device_id, self.original_mode, "Absolute"],
+                ["xsetwacom", "--set", device_id, "Mode", self.original_mode],
                 capture_output=True, text=True
             )
             if result.returncode == 0:
-                print(f"Device {device_id} restored to absolute mode")
+                print(f"Device {device_id} restored to {self.original_mode} mode")
                 return True
         except Exception as e:
             print(f"Error restoring absolute mode: {e}")
@@ -181,10 +181,21 @@ class WacomController:
     
     def cleanup(self):
         """Restore original device settings."""
+        print(f"WacomController cleanup for device {self.device_path}")
+        print(f"  was_enabled: {self.was_enabled}")
+        print(f"  original_mode: {self.original_mode}")
+        
         if self.was_enabled:
-            self.enable_local_input()
+            print("  Restoring local input...")
+            success = self.enable_local_input()
+            print(f"  Local input restored: {success}")
+            
         if self.original_mode:
-            self.restore_absolute_mode()
+            print("  Restoring original mode...")
+            success = self.restore_absolute_mode()
+            print(f"  Original mode restored: {success}")
+            
+        print("WacomController cleanup completed")
 
 
 class InputCapture:
@@ -233,15 +244,19 @@ class InputCapture:
     
     def stop(self):
         """Stop capturing input events."""
+        print(f"Stopping input capture for {self.device_path}")
         self.running = False
         
         if self.capture_thread:
+            print("  Waiting for capture thread to finish...")
             self.capture_thread.join(timeout=1)
         
         if self.wacom_controller:
+            print("  Running Wacom controller cleanup...")
             self.wacom_controller.cleanup()
         
         if self.device:
+            print("  Closing device...")
             self.device.close()
         
         print("Input capture stopped")

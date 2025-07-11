@@ -3,7 +3,11 @@ Consumer device emulation using uinput for TransWacom.
 """
 import threading
 import time
+import logging
 from typing import Dict, List, Optional, Any
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 try:
     import evdev
@@ -47,9 +51,9 @@ class VirtualDevice:
             try:
                 self.uinput.close()
                 self.active = False
-                print(f"Destroyed virtual device: {self.name}")
+                logger.info(f"Destroyed virtual device: {self.name}")
             except Exception as e:
-                print(f"Error destroying virtual device: {e}")
+                logger.error(f"Error destroying virtual device: {e}")
     
     def write_event(self, event_type: int, event_code: int, value: int):
         """Write an event to the virtual device."""
@@ -57,7 +61,7 @@ class VirtualDevice:
             try:
                 self.uinput.write(event_type, event_code, value)
             except Exception as e:
-                print(f"Error writing event: {e}")
+                logger.error(f"Error writing event: {e}")
     
     def sync(self):
         """Synchronize events (send EV_SYN)."""
@@ -65,7 +69,7 @@ class VirtualDevice:
             try:
                 self.uinput.syn()
             except Exception as e:
-                print(f"Error syncing events: {e}")
+                logger.error(f"Error syncing events: {e}")
 
 
 class WacomVirtualDevice(VirtualDevice):
@@ -95,22 +99,22 @@ class WacomVirtualDevice(VirtualDevice):
     
     def process_events(self, events: List[Dict[str, Any]]):
         """Process a batch of input events."""
-        print(f"WacomVirtualDevice: Processing {len(events)} events")
+        logger.debug(f"WacomVirtualDevice: Processing {len(events)} events")
         for event in events:
             code_str = event.get('code', '')
             value = event.get('value', 0)
-            print(f"  Event: {code_str} = {value}")
+            logger.debug(f"  Event: {code_str} = {value}")
             
             # Parse event code
             event_type, event_code = self._parse_event_code(code_str)
             if event_type is not None and event_code is not None:
                 self.write_event(event_type, event_code, value)
             else:
-                print(f"  ERROR: Could not parse {code_str}")
+                logger.warning(f"  Could not parse event code: {code_str}")
         
         # Sync after processing batch
         self.sync()
-        print("  Events synced to uinput")
+        logger.debug("  Events synced to uinput")
     
     def _parse_event_code(self, code_str: str) -> tuple:
         """Parse event code string to type and code integers."""
