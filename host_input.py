@@ -247,9 +247,12 @@ class InputCapture:
         print(f"Stopping input capture for {self.device_path}")
         self.running = False
         
-        if self.capture_thread:
+        # Only join thread if we're not calling from within the capture thread itself
+        if self.capture_thread and threading.current_thread() != self.capture_thread:
             print("  Waiting for capture thread to finish...")
             self.capture_thread.join(timeout=1)
+        elif self.capture_thread:
+            print("  Capture thread will stop on its own (called from within thread)")
         
         if self.wacom_controller:
             print("  Running Wacom controller cleanup...")
