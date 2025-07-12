@@ -35,6 +35,7 @@ from config_manager import create_config_manager
 from transnetwork import create_network, DiscoveredConsumer
 from host_input import create_host_input_manager, InputEvent
 from consumer_device_emulation import create_device_emulation_manager
+from zeroconf import ServiceListener
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -52,16 +53,13 @@ MENU_UPDATE_DELAY = 0.5
 def signal_handler(signum, frame):
     """Handle interrupt signals to ensure proper cleanup."""
     global _current_app
-    logger.info(f"Received signal {signum}, cleaning up...")
+    logger.info(f"Received signal {signum}, initiating graceful shutdown...")
     
     if _current_app:
-        try:
-            # Force cleanup
-            _current_app._emergency_cleanup()
-        except Exception as e:
-            logger.error(f"Error during emergency cleanup: {e}")
-    
-    sys.exit(0)
+        # The _quit method handles all cleanup and stops the icon loop.
+        # This is more graceful than emergency_cleanup() + sys.exit().
+        _current_app._quit()
+    # Let the application exit naturally after the main loop is stopped.
 
 
 class TrayIcon:
@@ -149,7 +147,7 @@ class TransWacomTrayApp(TrayIcon):
         self.device_manager = create_device_emulation_manager()
         
         # State
-        self.discovered_consumers: Dict[str, DiscoveredConsumer] = {}
+        self.discovered_consumers: Dict[str, Any] = {}
         self.outgoing_connections: Dict[str, Any] = {}  # Connections we initiated (as host)
         self.incoming_connections: List[str] = []  # Connections to us (as consumer)
         self.local_devices = []
@@ -160,7 +158,7 @@ class TransWacomTrayApp(TrayIcon):
         self._menu_update_timer = None
         
         # Auto-update setup
-        self._discovery_timer = None
+        self._stale_check_timer = None
         self._device_check_timer = None
         
         # Setup network discovery
@@ -181,17 +179,42 @@ class TransWacomTrayApp(TrayIcon):
     def _setup_discovery(self):
         """Setup mDNS discovery for other consumers."""
         try:
+            my_mdns_name = self.config.get_mdns_name()
+
             def on_consumer_discovered(consumer: DiscoveredConsumer):
-                # Filter out ourselves
-                if consumer.address == "127.0.0.1" and consumer.port == self.port:
+                # Filter out ourselves by comparing the advertised name and port
+                if consumer.name == my_mdns_name and consumer.port == self.port:
+                    logger.debug(f"Ignoring self in discovery: {consumer.name}")
                     return
                     
-                self.discovered_consumers[consumer.unique_id] = consumer
-                logger.info(f"Discovered consumer: {consumer.name} at {consumer.address}:{consumer.port}")
-                self._schedule_menu_update()
+                is_new = consumer.unique_id not in self.discovered_consumers
+                has_changed = not is_new and self.discovered_consumers[consumer.unique_id]['consumer'] != consumer
+
+                if is_new or has_changed:
+                    logger.info(f"Discovered/Updated consumer: {consumer.name} at {consumer.address}:{consumer.port}")
+                    self._schedule_menu_update()
+
+                # Always update the timestamp to keep it fresh
+                self.discovered_consumers[consumer.unique_id] = {
+                    'consumer': consumer,
+                    'timestamp': time.time()
+                }
                 
             # Start discovery
             success = self.network.discover_consumers(on_consumer_discovered)
+
+            # WORKAROUND: Patch the internal zeroconf listener to prevent crashes.
+            # The root cause is a missing `update_service` method in the listener
+            # inside the `transnetwork` module. This patch makes `update_service`
+            # behave like `add_service`, fixing both the crash and the stale consumer issue.
+            if success and hasattr(self.network, 'listener') and self.network.listener is not None:
+                listener = self.network.listener
+                # Check if the update_service method is the default, unimplemented one from the base class.
+                # This is more robust than checking for `__func__` which can fail with Cython-compiled methods.
+                if isinstance(listener, ServiceListener) and type(listener).update_service is ServiceListener.update_service:
+                    logger.info("Applying workaround: Patching zeroconf listener's update_service to prevent crashes.")
+                    listener.update_service = listener.add_service
+
             if not success:
                 logger.warning("mDNS discovery not available - will work only with manual connections")
         except Exception as e:
@@ -277,10 +300,14 @@ class TransWacomTrayApp(TrayIcon):
         """Start automatic background updates."""
         def update_devices():
             try:
+                # Compare based on a stable representation to avoid updates from new object instances
                 new_devices = self.detector.detect_all_devices()
-                if new_devices != self.local_devices:
+                new_device_paths = sorted([d.path for d in new_devices])
+                old_device_paths = sorted([d.path for d in self.local_devices])
+                
+                if new_device_paths != old_device_paths:
                     self.local_devices = new_devices
-                    logger.debug(f"Updated device list: {len(self.local_devices)} devices")
+                    logger.info(f"Device list changed. New count: {len(self.local_devices)}")
                     self._schedule_menu_update()
             except Exception as e:
                 logger.error(f"Error updating devices: {e}")
@@ -288,25 +315,30 @@ class TransWacomTrayApp(TrayIcon):
                 # Schedule next update
                 self._device_check_timer = threading.Timer(DEVICE_CHECK_INTERVAL, update_devices)
                 self._device_check_timer.start()
-        
-        def update_discovery():
+
+        def check_stale_consumers():
             try:
-                # Restart discovery periodically to catch new consumers
-                self.network.stop_discovery() # type: ignore
-                time.sleep(0.1)
-                self._setup_discovery()
+                now = time.time()
+                # A consumer is stale if not seen for 2.5x the discovery interval
+                stale_timeout = DISCOVERY_UPDATE_INTERVAL * 2.5
+                stale_keys = [
+                    key for key, data in self.discovered_consumers.items()
+                    if now - data.get('timestamp', 0) > stale_timeout
+                ]
+                if stale_keys:
+                    logger.info(f"Removing {len(stale_keys)} stale consumer(s): {', '.join(stale_keys)}")
+                    for key in stale_keys:
+                        del self.discovered_consumers[key]
+                    self._schedule_menu_update()
             except Exception as e:
-                logger.error(f"Error updating discovery: {e}")
+                logger.error(f"Error checking for stale consumers: {e}")
             finally:
-                # Schedule next discovery update
-                self._discovery_timer = threading.Timer(DISCOVERY_UPDATE_INTERVAL, update_discovery)
-                self._discovery_timer.start()
-        
+                self._stale_check_timer = threading.Timer(DISCOVERY_UPDATE_INTERVAL, check_stale_consumers)
+                self._stale_check_timer.start()
+
         # Initial device scan
         update_devices()
-        
-        # Start discovery updates
-        update_discovery()
+        check_stale_consumers()
     
     def _add_incoming_connection(self, host_name: str):
         """Add an incoming connection to the active list."""
@@ -373,8 +405,8 @@ class TransWacomTrayApp(TrayIcon):
                     continue
                     
                 available_consumers = [
-                    consumer for consumer in self.discovered_consumers.values()
-                    if consumer.unique_id not in self.outgoing_connections
+                    data['consumer'] for data in self.discovered_consumers.values()
+                    if data['consumer'].unique_id not in self.outgoing_connections
                 ]
                 
                 if available_consumers:
@@ -504,6 +536,7 @@ class TransWacomTrayApp(TrayIcon):
                 # Start input capture
                 def event_callback(device_type: str, events: List[InputEvent]):
                     if consumer.unique_id in self.outgoing_connections:
+                        logger.debug(f"Sending {len(events)} events of type {device_type}")
                         event_dicts = [event.to_dict() for event in events]
                         success = self.network.send_events(connection, device_type, event_dicts)
                         if not success:
@@ -579,9 +612,6 @@ class TransWacomTrayApp(TrayIcon):
     
     def _schedule_menu_update(self):
         """Schedule a menu update with a small delay to avoid rapid updates, only if menu is visible."""
-        # pystray no expone si el menú está abierto, así que solo actualizamos si el icono está visible
-        if self.icon and hasattr(self.icon, 'visible') and not self.icon.visible:
-            return  # No actualizar si el icono no está visible
         if self._menu_update_timer:
             self._menu_update_timer.cancel()
         self._menu_update_timer = threading.Timer(MENU_UPDATE_DELAY, self._update_menu)
@@ -605,7 +635,7 @@ class TransWacomTrayApp(TrayIcon):
         # Cancel timers
         if self._menu_update_timer: self._menu_update_timer.cancel()
         if self._device_check_timer: self._device_check_timer.cancel()
-        if self._discovery_timer: self._discovery_timer.cancel()
+        if self._stale_check_timer: self._stale_check_timer.cancel()
         
         # Stop all captures first to release local physical devices (host part)
         if hasattr(self, 'input_manager'):
@@ -639,7 +669,7 @@ class TransWacomTrayApp(TrayIcon):
             try: self.network.stop_discovery()
             except Exception as e: logger.error(f"Error stopping discovery: {e}")
 
-    def _quit(self, icon, item):
+    def _quit(self, icon=None, item=None):
         """Quit the application."""
         logger.info("Quitting application...")
         self._cleanup_resources(full_shutdown=True)
@@ -689,9 +719,9 @@ def main():
         app.start()
         
     except KeyboardInterrupt:
-        logger.info("Application interrupted by user")
+        logger.info("Application interrupted by user (KeyboardInterrupt)")
         if _current_app:
-            _current_app._emergency_cleanup()
+            _current_app._quit()
     except Exception as e:
         logger.error(f"Application error: {e}")
         if _current_app:

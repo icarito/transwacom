@@ -299,7 +299,6 @@ class InputCapture:
                     
                     if event_batch and self.event_callback:
                         device_type = self._get_device_type()
-                        print(f"Sending {len(event_batch)} events of type {device_type}")
                         self.event_callback(device_type, event_batch)
                     
                     event_batch = []

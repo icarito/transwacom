@@ -7,6 +7,7 @@ Supports both individual modes and unified GUI mode.
 import argparse
 import sys
 import time
+import traceback
 from typing import List, Optional
 
 # Import our modules
@@ -97,12 +98,23 @@ class TransWacomHost:
     
     def disconnect(self):
         """Disconnect from consumer."""
+        print("--> Stopping all input captures...", flush=True)
+        self.input_manager.stop_all_captures()
+        print("--> Input captures stopped.", flush=True)
+        
         if self.active_connection:
+            print("--> Disconnecting from consumer socket...", flush=True)
             self.network.disconnect_from_consumer(self.active_connection)
             self.active_connection = None
+            print("--> Socket disconnected.", flush=True)
         
-        self.input_manager.stop_all_captures()
-        print("Disconnected from consumer")
+        print("Disconnected from consumer", flush=True)
+
+    def stop_service(self):
+        """Alias for disconnect to standardize cleanup for the main loop."""
+        # The extra newline helps separate cleanup logs from app output.
+        print("\n--- Stopping host service ---", flush=True)
+        self.disconnect()
     
     def run_discovery(self):
         """Run interactive discovery mode."""
@@ -247,12 +259,21 @@ class TransWacomConsumer:
     
     def stop_service(self):
         """Stop the consumer service."""
+        print("\n--- Stopping consumer service ---", flush=True)
         if self.server_socket:
+            print("--> Closing server socket...", flush=True)
             self.server_socket.close()
+            print("--> Server socket closed.", flush=True)
         
+        print("--> Shutting down network services (mDNS)...", flush=True)
         self.network.shutdown()
+        print("--> Network services stopped.", flush=True)
+        
+        print("--> Destroying emulated devices...", flush=True)
         self.device_manager.destroy_all_devices()
-        print("Service stopped")
+        print("--> Emulated devices destroyed.", flush=True)
+        
+        print("Service stopped cleanly.", flush=True)
 
 
 class TransWacomUnified:
@@ -522,27 +543,37 @@ class TransWacomUnified:
     
     def stop_service(self):
         """Stop the service, ensuring all resources are released."""
-        print("\nStopping service...")
+        print("\n--- Stopping unified service ---", flush=True)
 
         # 1. Restore local input devices immediately. This is the most critical step.
+        print("--> Stopping all input captures...", flush=True)
         self.input_manager.stop_all_captures()
+        print("--> Input captures stopped.", flush=True)
         
         # 2. Close all outgoing network connections.
+        print(f"--> Closing {len(self.outgoing_connections)} outgoing connections...", flush=True)
         for info in self.outgoing_connections.values():
             self.network.disconnect_from_consumer(info['connection'])
         self.outgoing_connections.clear()
+        print("--> Outgoing connections closed.", flush=True)
         
         # 3. Stop the server for incoming connections.
         if self.server_socket:
+            print("--> Closing server socket...", flush=True)
             self.server_socket.close()
             self.server_socket = None
+            print("--> Server socket closed.", flush=True)
         
         # 4. Stop network discovery and advertising.
+        print("--> Stopping mDNS services...", flush=True)
         self.network.unpublish_consumer_service()
         self.network.stop_discovery()
+        print("--> mDNS services stopped.", flush=True)
 
         # 5. Destroy any emulated devices (if we received connections).
+        print("--> Destroying emulated devices...", flush=True)
         self.device_manager.destroy_all_devices()
+        print("--> Emulated devices destroyed.", flush=True)
         
         print("Service stopped cleanly.")
 
@@ -591,7 +622,7 @@ def main():
     parser.add_argument('--client', action='store_true',
                        help='Legacy: equivalent to --consumer')
     
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
     
     # Handle legacy arguments
     if args.server:
@@ -604,93 +635,86 @@ def main():
         print("Error: Cannot specify multiple modes")
         sys.exit(1)
 
-    if not any([args.host, args.consumer, args.unified, args.applet]):
-        if args.list_devices:
-            # Allow listing devices without mode selection
-            detector = create_detector()
-            devices = detector.detect_all_devices()
-            print("Detected devices:")
-            if not devices:
-                print("  No devices found.")
-            else:
-                for device in devices:
-                    print(f"  {device}")
-                    if device.capabilities:
-                        print(f"    Capabilities: {', '.join(device.capabilities)}")
-            return
+    # Handle --list-devices as a standalone command
+    if args.list_devices and not any([args.host, args.consumer, args.unified, args.applet]):
+        detector = create_detector()
+        devices = detector.detect_all_devices()
+        print("Detected devices:")
+        if not devices:
+            print("  No devices found.")
         else:
-            # Default to unified mode
-            args.unified = True
+            for device in devices:
+                print(f"  {device}")
+                if device.capabilities:
+                    print(f"    Capabilities: {', '.join(device.capabilities)}")
+        return
 
-    # Llamar al applet si se pasa --applet
+    # Launch GUI applet if requested
     if args.applet:
+        # Reconstruct sys.argv for the applet with any passthrough arguments
+        sys.argv = [sys.argv[0]] + unknown
         from tray_app_unified import main as tray_main
         tray_main()
         return
 
+    # Default to unified mode if no other mode is selected
+    if not any([args.host, args.consumer, args.unified]):
+        args.unified = True
+
+    service_object = None
     try:
         if args.unified:
-            # Unified mode
-            unified = TransWacomUnified()
-            unified.start_service(args.port)
+            service_object = TransWacomUnified()
+            service_object.start_service(args.port)
+
         elif args.host:
-            # Host mode
-            host = TransWacomHost()
+            service_object = TransWacomHost()
             if args.list_devices:
-                host.list_devices()
-                return
-            if args.discover:
-                host.run_discovery()
+                service_object.list_devices()
+            elif args.discover:
+                service_object.run_discovery()
             elif args.connect:
-                # Parse address:port
-                try:
-                    if ':' in args.connect:
-                        address, port = args.connect.split(':', 1)
-                        port = int(port)
-                    else:
-                        address = args.connect
-                        port = DEFAULT_PORT
-                except ValueError:
-                    print("Error: Invalid address format. Use ADDRESS:PORT")
-                    sys.exit(1)
-                # Select device
-                if args.device:
-                    device_path = args.device
+                if ':' in args.connect:
+                    address, port_str = args.connect.split(':', 1)
+                    port = int(port_str)
                 else:
-                    devices = host.detector.detect_all_devices()
+                    address = args.connect
+                    port = DEFAULT_PORT
+
+                device_path = args.device
+                if not device_path:
+                    devices = service_object.detector.detect_all_devices()
                     if not devices:
-                        print("No devices detected. Use --device to specify manually.")
+                        print("No devices detected. Use --device to specify one.")
                         sys.exit(1)
                     device_path = devices[0].path
                     print(f"Auto-selected device: {devices[0].name} ({device_path})")
-                # Connect
-                success = host.connect_to_consumer(address, port, device_path)
+
+                success = service_object.connect_to_consumer(address, port, device_path)
                 if success:
-                    try:
-                        print("Connected! Press Ctrl+C to disconnect...")
-                        while host.active_connection:
-                            time.sleep(1)
-                    except KeyboardInterrupt:
-                        host.disconnect()
+                    print("Connected! Press Ctrl+C to disconnect.")
+                    while True:
+                        time.sleep(1)
                 else:
                     print("Connection failed")
                     sys.exit(1)
             else:
                 print("Host mode: use --discover for discovery or --connect ADDRESS:PORT")
                 parser.print_help()
+
         elif args.consumer:
-            # Consumer mode
-            consumer = TransWacomConsumer()
-            consumer.start_service(args.port)
-        elif args.unified:
-            # Unified mode
-            unified = TransWacomUnified()
-            unified.start_service(args.port)
+            service_object = TransWacomConsumer()
+            service_object.start_service(args.port)
+
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        print("\nInterrupted by user. Shutting down...")
     except Exception as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+        print(f"\nAn unexpected error occurred: {e}")
+        traceback.print_exc()
+    finally:
+        # This block is guaranteed to run, ensuring cleanup happens.
+        if service_object:
+            service_object.stop_service()
 
 
 if __name__ == "__main__":
