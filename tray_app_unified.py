@@ -380,6 +380,7 @@ class TransWacomTrayApp(TrayIcon):
                 if new_device_paths != old_device_paths:
                     self.local_devices = new_devices
                     logger.info(f"Device list changed. New count: {len(self.local_devices)}")
+                    self._update_icon_status()
                     self._schedule_menu_update()
             except Exception as e:
                 logger.error(f"Error updating devices: {e}")
@@ -443,20 +444,25 @@ class TransWacomTrayApp(TrayIcon):
     def _create_tray_icon(self):
         """Create the system tray icon."""
         image = self.create_icon_image("blue", "idle")
-        
         self.icon = pystray.Icon(
             "TransWacom",
             image,
             "TransWacom",
             menu=self._create_menu()
         )
+        # Ajustar el color inicial según el estado real
+        self._update_icon_status()
     
     def _create_menu_connection_items(self) -> List[pystray.MenuItem]:
         """Create menu items for active connections."""
         items = []
         if self.incoming_connections:
             for host in self.incoming_connections:
-                items.append(pystray.MenuItem(f"📥 Recibiendo de: {host}", None, enabled=False))
+                items.append(pystray.MenuItem(
+                    f"📥 Recibiendo de: {host}",
+                    partial(self._disconnect_incoming, host),
+                    enabled=True
+                ))
         
         if self.outgoing_connections:
             for consumer_id, info in self.outgoing_connections.items():
@@ -492,8 +498,8 @@ class TransWacomTrayApp(TrayIcon):
                     items.append(pystray.MenuItem(f"🖊️ {device.name}", device_menu))
                 else:
                     items.append(pystray.MenuItem(f"🖊️ {device.name} (sin consumidores)", None, enabled=False))
-        else:
-            items.append(pystray.MenuItem("No hay dispositivos disponibles", None, enabled=False))
+        #else:
+        #    items.append(pystray.MenuItem("No hay dispositivos disponibles", None, enabled=False))
         return items
 
     def _create_menu_incoming_mgmt_items(self) -> List[pystray.MenuItem]:
@@ -525,12 +531,6 @@ class TransWacomTrayApp(TrayIcon):
             
             device_items = self._create_menu_device_items()
             menu_items.extend(device_items)
-            
-            # Incoming connections management
-            incoming_mgmt_items = self._create_menu_incoming_mgmt_items()
-            if incoming_mgmt_items:
-                menu_items.append(pystray.Menu.SEPARATOR)
-                menu_items.extend(incoming_mgmt_items)
             
             menu_items.append(pystray.Menu.SEPARATOR)
             menu_items.append(pystray.MenuItem("❌ Salir", self._quit))
