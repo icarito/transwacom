@@ -521,25 +521,30 @@ class TransWacomUnified:
         print(f"  Discovered consumers: {len(self.discovered_consumers)}")
     
     def stop_service(self):
-        """Stop the service."""
-        # Disconnect all outgoing connections
-        for consumer_id in list(self.outgoing_connections.keys()):
-            self._disconnect_outgoing(consumer_id)
-        
-        # Stop all captures
+        """Stop the service, ensuring all resources are released."""
+        print("\nStopping service...")
+
+        # 1. Restore local input devices immediately. This is the most critical step.
         self.input_manager.stop_all_captures()
         
-        # Stop server
+        # 2. Close all outgoing network connections.
+        for info in self.outgoing_connections.values():
+            self.network.disconnect_from_consumer(info['connection'])
+        self.outgoing_connections.clear()
+        
+        # 3. Stop the server for incoming connections.
         if self.server_socket:
             self.server_socket.close()
+            self.server_socket = None
         
-        # Stop advertising
+        # 4. Stop network discovery and advertising.
         self.network.unpublish_consumer_service()
-        
-        # Stop discovery
         self.network.stop_discovery()
+
+        # 5. Destroy any emulated devices (if we received connections).
+        self.device_manager.destroy_all_devices()
         
-        print("Service stopped")
+        print("Service stopped cleanly.")
 
 
 def main():

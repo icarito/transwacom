@@ -607,9 +607,13 @@ class TransWacomTrayApp(TrayIcon):
         if self._device_check_timer: self._device_check_timer.cancel()
         if self._discovery_timer: self._discovery_timer.cancel()
         
-        # Stop all captures first to release devices
+        # Stop all captures first to release local physical devices (host part)
         if hasattr(self, 'input_manager'):
             self.input_manager.stop_all_captures()
+
+        # Destroy all emulated devices to clean up virtual ones (consumer part)
+        if hasattr(self, 'device_manager'):
+            self.device_manager.destroy_all_devices()
         
         # Close outgoing connections
         for info in self.outgoing_connections.values():
