@@ -262,7 +262,10 @@ class TransWacomTrayApp(TrayIcon):
     def _setup_server(self):
         """Setup TCP server for incoming connections."""
         try:
-            def auth_callback(handshake: dict) -> bool:
+            # FIX: The callback should return the host_name on success (a truthy value)
+            # or None on failure. This gives the network layer the necessary info
+            # to register the connection properly in its active_connections list.
+            def auth_callback(handshake: dict) -> Optional[str]:
                 host_name = handshake.get('host_name', 'Unknown')
                 host_id = handshake.get('host_id', '')
                 devices = handshake.get('devices', [])
@@ -272,12 +275,12 @@ class TransWacomTrayApp(TrayIcon):
                 if self.config.is_host_trusted(host_name, host_id):
                     if self.config.should_auto_accept_host(host_name):
                         logger.info(f"Auto-accepting trusted host: {host_name}")
-                        self._add_incoming_connection(host_name)
-                        return True
+                        self._add_incoming_connection(host_name) # Update UI
+                        return host_name # Return hostname on success
 
                 # Sin trusted: pedir confirmación interactiva
                 logger.info(f"Esperando autorización del usuario para {host_name} ({', '.join(device_names)})")
-                user_decision = {'accepted': None}
+                user_decision = {'result': None} # Can store hostname, False, or None
                 event = threading.Event()
 
 
@@ -289,7 +292,7 @@ class TransWacomTrayApp(TrayIcon):
                     logger.info(f"[NOTIFY] CALLBACK: Usuario aceptó la conexión de {host_name}")
                     def set_accept():
                         logger.info(f"[NOTIFY] set_accept ejecutado para {host_name}")
-                        user_decision['accepted'] = True
+                        user_decision['result'] = host_name # Store hostname on accept
                         self._add_incoming_connection(host_name)
                         event.set()
                     GLib.idle_add(set_accept)
@@ -298,7 +301,7 @@ class TransWacomTrayApp(TrayIcon):
                     logger.info(f"[NOTIFY] CALLBACK: Usuario rechazó la conexión de {host_name}")
                     def set_reject():
                         logger.info(f"[NOTIFY] set_reject ejecutado para {host_name}")
-                        user_decision['accepted'] = False
+                        user_decision['result'] = False # Use False for explicit rejection
                         event.set()
                     GLib.idle_add(set_reject)
 
@@ -315,11 +318,12 @@ class TransWacomTrayApp(TrayIcon):
 
                 # Esperar la decisión del usuario (máximo 30s)
                 event.wait(timeout=30)
-                if user_decision['accepted']:
-                    return True
-                else:
+                
+                if user_decision['result'] is False or user_decision['result'] is None:
                     logger.info(f"Solicitud de conexión de {host_name} rechazada o sin respuesta")
-                    return False
+                    return None
+                else:
+                    return user_decision['result'] # Return hostname or None
             
             def event_callback(device_type: str, events: list):
                 try:
@@ -643,44 +647,35 @@ class TransWacomTrayApp(TrayIcon):
     def _disconnect_outgoing(self, consumer_id: str, *args, **kwargs):
         """Disconnect an outgoing connection."""
         if consumer_id in self.outgoing_connections:
-            try:
-                info = self.outgoing_connections.pop(consumer_id)
-                
-                # Stop input capture
-                self.input_manager.stop_capture(info['device_path'])
-                
-                # Close network connection
-                self.network.disconnect_from_consumer(info['connection'])
-
-                self.show_notification(
-                    "Desconectado",
-                    f"Desconectado de {info['name']}"
-                )
-                
-                self._update_icon_status()
-                self._schedule_menu_update()
-                
-            except Exception as e:
-                logger.error(f"Error disconnecting: {e}")
-                # If pop failed or something else went wrong, ensure state is clean
-                if consumer_id in self.outgoing_connections:
-                    del self.outgoing_connections[consumer_id]
+            del self.outgoing_connections[consumer_id]
+            self.show_notification(
+                "Conexión Finalizada",
+                f"Se ha desconectado del consumidor {consumer_id}"
+            )
+            self._update_icon_status()
+            self._schedule_menu_update()
     
     def _disconnect_incoming(self, host_name: str, *args, **kwargs):
         """Disconnect an incoming connection."""
         if host_name in self.incoming_connections:
-            try:
-                self.incoming_connections.remove(host_name)
-                # Desconexión real del socket
-                self.network.disconnect_incoming_host(host_name)
-                self.show_notification(
-                    "Desconectado",
-                    f"Desconectado de {host_name}"
-                )
-                self._update_icon_status()
-                self._schedule_menu_update()
-            except Exception as e:
-                logger.error(f"Error disconnecting incoming: {e}")
+            self.incoming_connections.remove(host_name)
+            # Agregar registro para depuración
+            logger.info(f"Intentando desconectar {host_name}. Conexiones activas: {list(self.network.active_connections.keys())}")
+            # Buscar el socket asociado al host_name
+            # BUGFIX: La clave de active_connections es la dirección del par (IP:puerto), no el hostname.
+            # Debemos buscar en los detalles de la conexión, donde el hostname debería estar almacenado.
+            peer_addr = next((addr for addr, conn_info in self.network.active_connections.items() if conn_info.get('host_name') == host_name), None)
+            if peer_addr and peer_addr in self.network.active_connections:
+                sock = self.network.active_connections[peer_addr]['socket']
+                self.network.disconnect_from_consumer(sock)  # Cerrar conexión de red
+            else:
+                logger.warning(f"No se encontró una conexión activa para {host_name} o ya fue cerrada.")
+            self.show_notification(
+                "Conexión Finalizada",
+                f"Se ha desconectado de {host_name}"
+            )
+            self._update_icon_status()
+            self._schedule_menu_update()
     
     def _schedule_menu_update(self):
         """Schedule a menu update with a small delay to avoid rapid updates, only if menu is visible."""
