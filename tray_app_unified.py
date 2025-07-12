@@ -20,13 +20,15 @@ from functools import partial, wraps
 try:
     import pystray
     from PIL import Image, ImageDraw
-    from plyer import notification
+    import gi
+    gi.require_version('Notify', '0.7')
+    from gi.repository import Notify
     GUI_AVAILABLE = True
 except ImportError:
     pystray = None
     Image = None
-    ImageDraw = None  
-    notification = None
+    ImageDraw = None
+    Notify = None
     GUI_AVAILABLE = False
 
 # TransWacom modules
@@ -110,15 +112,52 @@ class TrayIcon:
             
         return image
     
-    def show_notification(self, title: str, message: str, timeout: int = 5):
-        """Show desktop notification."""
+
+
+    _glib_loop_started = False
+    _active_notifications = []  # Para evitar GC prematuro
+
+    def _ensure_glib_loop(self):
+        """Inicia el loop de GLib en un hilo si no está corriendo."""
+        if not self._glib_loop_started:
+            try:
+                import gi
+                from gi.repository import GLib
+                import threading
+                def run_loop():
+                    logger.info("[GLib] MainLoop iniciado en hilo de fondo")
+                    loop = GLib.MainLoop()
+                    loop.run()
+                t = threading.Thread(target=run_loop, daemon=True)
+                t.start()
+                self._glib_loop_started = True
+            except Exception as e:
+                logger.error(f"No se pudo iniciar el loop de GLib: {e}")
+
+    def show_notification(self, title: str, message: str, timeout: int = 5, actions: Optional[list] = None):
+        """
+        Show desktop notification using GTK3 Notify.
+        If actions is provided, it should be a list of tuples: (action_id, label, callback)
+        """
         try:
-            notification.notify(
-                title=title,
-                message=message,
-                timeout=timeout,
-                app_name="TransWacom"
-            )
+            logger.info(f"[NOTIFY] Mostrando notificación: {title} - {message} (acciones: {bool(actions)})")
+            self._ensure_glib_loop()
+            if Notify is None:
+                raise RuntimeError("Notify (gi.repository) is not available")
+            # Init libnotify if not already
+            if not Notify.is_initted():
+                Notify.init("TransWacom")
+            notification = Notify.Notification.new(title, message)
+            notification.set_timeout(timeout * 1000)  # ms
+            # Guardar referencia para evitar GC
+            self._active_notifications.append(notification)
+            # Add actions if provided
+            if actions:
+                for action_id, label, callback in actions:
+                    logger.info(f"[NOTIFY] Agregando acción: {action_id} - {label}")
+                    notification.add_action(action_id, label, callback, None)
+            notification.show()
+            logger.info(f"[NOTIFY] Notificación mostrada (obj: {id(notification)})")
         except Exception as e:
             logger.error(f"Failed to show notification: {e}")
     
@@ -227,27 +266,60 @@ class TransWacomTrayApp(TrayIcon):
                 host_name = handshake.get('host_name', 'Unknown')
                 host_id = handshake.get('host_id', '')
                 devices = handshake.get('devices', [])
-                
-                # Show authorization notification
                 device_names = [d.get('name', 'Unknown Device') for d in devices]
-                
-                self.show_notification(
-                    "Nueva Conexión",
-                    f"{host_name} quiere compartir: {', '.join(device_names)}",
-                    timeout=15
-                )
-                
-                # Check if host is trusted
+
+                # Si es host confiable y auto-aceptar, no preguntar
                 if self.config.is_host_trusted(host_name, host_id):
                     if self.config.should_auto_accept_host(host_name):
                         logger.info(f"Auto-accepting trusted host: {host_name}")
                         self._add_incoming_connection(host_name)
                         return True
-                
-                # For now, auto-accept (in a real implementation, show dialog)
-                logger.info(f"Accepting connection request from {host_name} for devices: {device_names}")
-                self._add_incoming_connection(host_name)
-                return True
+
+                # Sin trusted: pedir confirmación interactiva
+                logger.info(f"Esperando autorización del usuario para {host_name} ({', '.join(device_names)})")
+                user_decision = {'accepted': None}
+                event = threading.Event()
+
+
+                # Usar GLib.idle_add para asegurar ejecución en hilo principal de Python
+                import gi
+                from gi.repository import GLib
+
+                def on_accept(notification, action, data=None):
+                    logger.info(f"[NOTIFY] CALLBACK: Usuario aceptó la conexión de {host_name}")
+                    def set_accept():
+                        logger.info(f"[NOTIFY] set_accept ejecutado para {host_name}")
+                        user_decision['accepted'] = True
+                        self._add_incoming_connection(host_name)
+                        event.set()
+                    GLib.idle_add(set_accept)
+
+                def on_reject(notification, action, data=None):
+                    logger.info(f"[NOTIFY] CALLBACK: Usuario rechazó la conexión de {host_name}")
+                    def set_reject():
+                        logger.info(f"[NOTIFY] set_reject ejecutado para {host_name}")
+                        user_decision['accepted'] = False
+                        event.set()
+                    GLib.idle_add(set_reject)
+
+                actions = [
+                    ("accept", "Aceptar", on_accept),
+                    ("reject", "Rechazar", on_reject)
+                ]
+                self.show_notification(
+                    "Nueva Conexión",
+                    f"{host_name} quiere compartir: {', '.join(device_names)}",
+                    timeout=30,
+                    actions=actions
+                )
+
+                # Esperar la decisión del usuario (máximo 30s)
+                event.wait(timeout=30)
+                if user_decision['accepted']:
+                    return True
+                else:
+                    logger.info(f"Solicitud de conexión de {host_name} rechazada o sin respuesta")
+                    return False
             
             def event_callback(device_type: str, events: list):
                 try:
