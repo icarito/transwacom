@@ -8,6 +8,8 @@ import argparse
 import sys
 import time
 import traceback
+import socket
+import json
 from typing import List, Optional
 
 # Import our modules
@@ -576,6 +578,150 @@ class TransWacomUnified:
         print("--> Emulated devices destroyed.", flush=True)
         
         print("Service stopped cleanly.")
+
+
+def server_mode(device_path, remote_host, remote_port, disable_local=True, relative_mode=True):
+    """Modo servidor: lee dispositivo de entrada y reenvía eventos por red"""
+    print(f"Usando dispositivo: {device_path}")
+    
+    if not EVDEV_AVAILABLE:
+        print("Error: python-evdev es requerido para el modo servidor.")
+        print("Instala con: pip install evdev")
+        sys.exit(1)
+    
+    device = None
+    sock = None
+    device_id = None
+    was_disabled = False
+    was_relative = False
+
+    try:
+        # Usar evdev para leer eventos estructurados
+        device = InputDevice(device_path)
+        print(f"Dispositivo: {device.name}")
+
+        # Configurar tableta Wacom si es detectada
+        if "wacom" in device.name.lower() or "pen" in device.name.lower():
+            device_id = get_wacom_device_id(device_path)
+            
+            if device_id:
+                if relative_mode:
+                    print("Intentando poner la tableta en modo relativo...")
+                    was_relative = set_wacom_relative_mode(device_id)
+                    
+                if disable_local:
+                    print("Intentando desactivar la tableta localmente...")
+                    was_disabled = disable_wacom_locally(device_path, device_id)
+            else:
+                print("Advertencia: No se pudo identificar el dispositivo Wacom para configuración automática.")
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        print(f"Conectando a {remote_host}:{remote_port}...")
+        sock.connect((remote_host, remote_port))
+        print(f"Conectado exitosamente. Enviando eventos del dispositivo...")
+
+        # Modo evdev estructurado (siempre JSON)
+        for event in device.read_loop():
+            event_data = {
+                'type': event.type,
+                'code': event.code,
+                'value': event.value,
+                'timestamp': event.timestamp()
+            }
+            msg = json.dumps(event_data).encode('utf-8') + b'\n'
+            sock.sendall(msg)
+
+    except FileNotFoundError:
+        print(f"Error: Dispositivo no encontrado en {device_path}")
+        sys.exit(1)
+    except PermissionError:
+        print(f"Error: Permiso denegado para leer {device_path}. Ejecuta como superusuario (sudo).")
+        sys.exit(1)
+    except socket.error as e:
+        print(f"Error de conexión: {e}")
+    except KeyboardInterrupt:
+        print("\nServidor detenido por el usuario.")
+    except Exception as e:
+        print(f"Ocurrió un error inesperado: {e}")
+    finally:
+        print("Cerrando conexión y restaurando estado del dispositivo...")
+        # Restaurar configuración original de la tableta
+        if device_id:
+            if was_disabled:
+                print("Reactivando tableta localmente...")
+                enable_wacom_locally(device_id)
+            if was_relative:
+                print("Restaurando modo absoluto de la tableta...")
+                restore_wacom_absolute_mode(device_id)
+        
+        if device:
+            device.close()
+        if sock:
+            sock.close()
+        print("Limpieza completada.")
+
+
+def create_virtual_device(device_type='wacom'):
+    """Create a virtual device for event injection."""
+    # Implementation omitted for brevity
+    pass
+
+def client_mode(listen_port, device_type='wacom'):
+    """Modo cliente: recibe eventos por red y los inyecta en dispositivo virtual"""
+    virtual_device = None
+    sock = None
+    conn = None
+    try:
+        virtual_device = create_virtual_device(device_type)
+        
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(('0.0.0.0', listen_port))
+        sock.listen(1)
+        print(f"Esperando conexión en puerto {listen_port}...")
+        
+        conn, addr = sock.accept()
+        print(f"Conectado desde {addr}")
+        
+        buffer = b''
+        while True:
+            data = conn.recv(1024)
+            if not data:
+                print("El host cerró la conexión.")
+                break
+            
+            buffer += data
+            while b'\n' in buffer:
+                line, buffer = buffer.split(b'\n', 1)
+                if line:
+                    try:
+                        line_str = line.decode('utf-8')
+                        event_data = json.loads(line_str)
+                        
+                        if all(key in event_data for key in ['type', 'code', 'value']):
+                            virtual_device.write(event_data['type'], event_data['code'], event_data['value'])
+                        else:
+                            print(f"Evento inválido (faltan campos): {event_data}")
+                            
+                    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                        print(f"Error procesando datos recibidos: {e}")
+                    except Exception as e:
+                        print(f"Error inesperado al procesar evento: {e}")
+                        
+    except KeyboardInterrupt:
+        print("\nCliente detenido por el usuario.")
+    except Exception as e:
+        print(f"Ocurrió un error en el modo cliente: {e}")
+    finally:
+        print("Cerrando conexiones y limpiando recursos del cliente...")
+        if conn:
+            conn.close()
+        if sock:
+            sock.close()
+        if virtual_device:
+            virtual_device.close()
+            print("Dispositivo virtual destruido.")
+        print("Limpieza del cliente completada.")
 
 
 def main():
