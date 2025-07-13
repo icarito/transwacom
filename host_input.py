@@ -142,11 +142,25 @@ class WacomController:
         return False
     
     def set_relative_mode(self) -> bool:
-        """Set tablet to relative mode (mouse-like)."""
+        """Set tablet to relative mode (mouse-like), guardando el modo original real."""
         device_id = self.get_device_id()
         if not device_id:
             return False
-        
+
+        # Consultar el modo actual antes de cambiarlo
+        try:
+            result = subprocess.run(
+                ["xsetwacom", "--get", device_id, "Mode"],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                current_mode = result.stdout.strip()
+                if not self.original_mode:
+                    self.original_mode = current_mode
+                print(f"Modo original de la tableta: {self.original_mode}")
+        except Exception as e:
+            print(f"Error obteniendo el modo original: {e}")
+
         try:
             result = subprocess.run(
                 ["xsetwacom", "--set", device_id, "Mode", "Relative"],
@@ -154,11 +168,10 @@ class WacomController:
             )
             if result.returncode == 0:
                 print(f"Device {device_id} set to relative mode")
-                self.original_mode = "Absolute"
                 return True
         except Exception as e:
             print(f"Error setting relative mode: {e}")
-        
+
         return False
     
     def restore_absolute_mode(self) -> bool:
@@ -182,21 +195,28 @@ class WacomController:
     
     def cleanup(self):
         """Restore original device settings."""
-        print(f"WacomController cleanup for device {self.device_path}")
-        print(f"  was_enabled: {self.was_enabled}")
-        print(f"  original_mode: {self.original_mode}")
-        
+        print(f"[DEBUG] WacomController cleanup for device {self.device_path}")
+        print(f"[DEBUG]  was_enabled: {self.was_enabled}")
+        print(f"[DEBUG]  original_mode: {self.original_mode}")
+
+        tried_reset = False
         if self.was_enabled:
-            print("  Restoring local input...")
+            print("[DEBUG]  Attempting to restore local input...")
             success = self.enable_local_input()
-            print(f"  Local input restored: {success}")
-            
+            print(f"[DEBUG]  Local input restored: {success}")
+            tried_reset = True
+
         if self.original_mode:
-            print("  Restoring original mode...")
+            print("[DEBUG]  Attempting to restore original mode...")
             success = self.restore_absolute_mode()
-            print(f"  Original mode restored: {success}")
-            
-        print("WacomController cleanup completed")
+            print(f"[DEBUG]  Original mode restored: {success}")
+            tried_reset = True
+
+        if not tried_reset:
+            print(f"[DEBUG]  No reset actions were performed for device {self.device_path}")
+        else:
+            print(f"[DEBUG]  Tablet reset attempted for device {self.device_path}")
+        print("[DEBUG] WacomController cleanup completed")
 
 
 class InputCapture:

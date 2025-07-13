@@ -647,6 +647,10 @@ class TransWacomTrayApp(TrayIcon):
     def _disconnect_outgoing(self, consumer_id: str, *args, **kwargs):
         """Disconnect an outgoing connection."""
         if consumer_id in self.outgoing_connections:
+            # Restaurar la tableta local al desconectar
+            logger.info(f"[TW] Restaurando estado de la tableta tras desconexión de {consumer_id}")
+            if hasattr(self, 'input_manager'):
+                self.input_manager.stop_all_captures()
             del self.outgoing_connections[consumer_id]
             self.show_notification(
                 "Conexión Finalizada",

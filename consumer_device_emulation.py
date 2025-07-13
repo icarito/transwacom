@@ -21,20 +21,23 @@ except ImportError:
     EVDEV_AVAILABLE = False
 
 
+
+import threading
+
 class VirtualDevice:
     """Base class for virtual input devices."""
-    
     def __init__(self, name: str, capabilities: Dict):
         if not EVDEV_AVAILABLE:
             raise RuntimeError("evdev is required for device emulation")
-        
         self.name = name
         self.capabilities = capabilities
         self.uinput = None
         self.active = False
-    
+        self._stop_event = threading.Event()
+        self._recv_thread = None
+        self._sock = None
+
     def create(self) -> bool:
-        """Create the virtual device."""
         try:
             self.uinput = UInput(self.capabilities, name=self.name)
             self.active = True
@@ -44,9 +47,9 @@ class VirtualDevice:
             print(f"Failed to create virtual device {self.name}: {e}")
             print("Make sure you have permissions for /dev/uinput (usually requires input group)")
             return False
-    
+
     def destroy(self):
-        """Destroy the virtual device."""
+        self._stop_event.set()
         if self.uinput:
             try:
                 self.uinput.close()
@@ -54,22 +57,58 @@ class VirtualDevice:
                 logger.info(f"Destroyed virtual device: {self.name}")
             except Exception as e:
                 logger.error(f"Error destroying virtual device: {e}")
-    
+        # Cerrar socket si está guardado
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+        # Esperar a que el hilo termine
+        if self._recv_thread and self._recv_thread.is_alive():
+            self._recv_thread.join(timeout=2)
+
     def write_event(self, event_type: int, event_code: int, value: int):
-        """Write an event to the virtual device."""
         if self.uinput and self.active:
             try:
                 self.uinput.write(event_type, event_code, value)
             except Exception as e:
                 logger.error(f"Error writing event: {e}")
-    
+
     def sync(self):
-        """Synchronize events (send EV_SYN)."""
         if self.uinput and self.active:
             try:
                 self.uinput.syn()
             except Exception as e:
                 logger.error(f"Error syncing events: {e}")
+
+    def start_receiving(self, sock):
+        """Start a thread to receive events and inject them. Guarda el socket para poder cerrarlo luego."""
+        self._sock = sock
+        self._stop_event.clear()
+        self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
+        self._recv_thread.start()
+
+    def _recv_loop(self):
+        import json
+        buffer = b''
+        try:
+            while not self._stop_event.is_set():
+                data = self._sock.recv(1024)
+                if not data:
+                    break
+                buffer += data
+                while b'\n' in buffer:
+                    line, buffer = buffer.split(b'\n', 1)
+                    if line:
+                        try:
+                            line_str = line.decode('utf-8')
+                            event_data = json.loads(line_str)
+                            if all(key in event_data for key in ['type', 'code', 'value']):
+                                self.write_event(event_data['type'], event_data['code'], event_data['value'])
+                        except Exception as e:
+                            logger.error(f"Error processing event: {e}")
+        except Exception as e:
+            logger.error(f"Error in receive loop: {e}")
 
 
 class WacomVirtualDevice(VirtualDevice):

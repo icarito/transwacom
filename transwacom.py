@@ -877,5 +877,26 @@ def main():
             service_object.stop_service()
 
 
+import signal
+
+def _host_signal_handler(signum, frame):
+    global service_object
+    print(f"\n[Signal handler] Caught signal {signum}. Cleaning up...")
+    try:
+        if service_object:
+            service_object.stop_service()
+    except Exception as e:
+        print(f"Error during cleanup: {e}")
+    finally:
+        sys.exit(0)
+
 if __name__ == "__main__":
+    # Registrar handler solo para host/unified
+    import inspect
+    # service_object se define en main(), pero lo declaramos global aquí para el handler
+    global service_object
+    service_object = None
+    # Pre-registro de signal para asegurar cleanup incluso si KeyboardInterrupt no lo captura
+    signal.signal(signal.SIGINT, _host_signal_handler)
+    signal.signal(signal.SIGTERM, _host_signal_handler)
     main()
