@@ -77,10 +77,14 @@ class TransWacomHost:
         # Start input capture
         def event_callback(device_type: str, events: List[InputEvent]):
             if self.active_connection:
-                event_dicts = [event.to_dict() for event in events]
-                success = self.network.send_events(self.active_connection, device_type, event_dicts)
-                if not success:
-                    print("Lost connection to consumer")
+                try:
+                    event_dicts = [event.to_dict() for event in events]
+                    success = self.network.send_events(self.active_connection, device_type, event_dicts)
+                    if not success:
+                        print("Lost connection to consumer")
+                        self.disconnect()
+                except Exception as e:
+                    print(f"Error sending events: {e}")
                     self.disconnect()
         
         # Configure capture settings from config
@@ -99,17 +103,21 @@ class TransWacomHost:
             return False
     
     def disconnect(self):
-        """Disconnect from consumer."""
+        """Disconnect from consumer and restore device state."""
         print("--> Stopping all input captures...", flush=True)
         self.input_manager.stop_all_captures()
         print("--> Input captures stopped.", flush=True)
-        
+        # Restaurar estado de la tableta si corresponde
+        try:
+            if hasattr(self.input_manager, 'cleanup'):
+                self.input_manager.cleanup()
+        except Exception as e:
+            print(f"Error during input_manager cleanup: {e}")
         if self.active_connection:
             print("--> Disconnecting from consumer socket...", flush=True)
             self.network.disconnect_from_consumer(self.active_connection)
             self.active_connection = None
             print("--> Socket disconnected.", flush=True)
-        
         print("Disconnected from consumer", flush=True)
 
     def stop_service(self):
@@ -260,21 +268,27 @@ class TransWacomConsumer:
             self.stop_service()
     
     def stop_service(self):
-        """Stop the consumer service."""
+        """Stop the consumer service and destroy virtual devices."""
         print("\n--- Stopping consumer service ---", flush=True)
         if self.server_socket:
             print("--> Closing server socket...", flush=True)
-            self.server_socket.close()
+            try:
+                self.server_socket.close()
+            except Exception as e:
+                print(f"Error closing server socket: {e}")
             print("--> Server socket closed.", flush=True)
-        
         print("--> Shutting down network services (mDNS)...", flush=True)
-        self.network.shutdown()
+        try:
+            self.network.shutdown()
+        except Exception as e:
+            print(f"Error shutting down network: {e}")
         print("--> Network services stopped.", flush=True)
-        
         print("--> Destroying emulated devices...", flush=True)
-        self.device_manager.destroy_all_devices()
+        try:
+            self.device_manager.destroy_all_devices()
+        except Exception as e:
+            print(f"Error destroying emulated devices: {e}")
         print("--> Emulated devices destroyed.", flush=True)
-        
         print("Service stopped cleanly.", flush=True)
 
 

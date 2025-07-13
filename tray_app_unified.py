@@ -656,18 +656,25 @@ class TransWacomTrayApp(TrayIcon):
             self._schedule_menu_update()
     
     def _disconnect_incoming(self, host_name: str, *args, **kwargs):
-        """Disconnect an incoming connection."""
+        """Disconnect an incoming connection (consumer side)."""
         if host_name in self.incoming_connections:
             self.incoming_connections.remove(host_name)
-            # Agregar registro para depuración
             logger.info(f"Intentando desconectar {host_name}. Conexiones activas: {list(self.network.active_connections.keys())}")
             # Buscar el socket asociado al host_name
-            # BUGFIX: La clave de active_connections es la dirección del par (IP:puerto), no el hostname.
-            # Debemos buscar en los detalles de la conexión, donde el hostname debería estar almacenado.
             peer_addr = next((addr for addr, conn_info in self.network.active_connections.items() if conn_info.get('host_name') == host_name), None)
             if peer_addr and peer_addr in self.network.active_connections:
                 sock = self.network.active_connections[peer_addr]['socket']
-                self.network.disconnect_from_consumer(sock)  # Cerrar conexión de red
+                try:
+                    self.network.disconnect_from_consumer(sock)  # Cerrar conexión de red
+                except Exception as e:
+                    logger.error(f"Error al cerrar la conexión de red: {e}")
+                # Destruir dispositivos virtuales asociados
+                try:
+                    if hasattr(self, 'device_manager'):
+                        self.device_manager.destroy_all_devices()
+                        logger.info(f"Dispositivo virtual destruido tras desconexión de {host_name}")
+                except Exception as e:
+                    logger.error(f"Error destruyendo dispositivo virtual: {e}")
             else:
                 logger.warning(f"No se encontró una conexión activa para {host_name} o ya fue cerrada.")
             self.show_notification(
