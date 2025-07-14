@@ -497,36 +497,6 @@ class TransNetwork:
         self.on_consumer_lost = on_consumer_lost
         return self.discover_consumers(on_consumer_discovered)
     
-    def start_advertising(self, port: int, capabilities: List[str], name: str = None):
-        """Start advertising service for GUI."""
-        if name is None:
-            name = socket.gethostname()
-        return self.publish_consumer_service(name, port, capabilities)
-    
-    def start_consumer_server(self, port: int, on_connection_request: Callable,
-                            on_connection_established: Callable,
-                            on_connection_lost: Callable,
-                            on_events_received: Callable):
-        """Start consumer server with GUI callbacks."""
-        
-        def auth_callback(handshake_data: Dict[str, Any]) -> bool:
-            host_name = handshake_data.get('host_name', 'Unknown')
-            address = handshake_data.get('address', 'Unknown')
-            device_info = handshake_data.get('devices', [{}])[0] if handshake_data.get('devices') else {}
-            return on_connection_request(host_name, address, device_info)
-        
-        def event_callback(device_type: str, events: List[Dict[str, Any]]):
-            connection_id = f"connection_{int(time.time())}"  # Simple connection ID
-            on_events_received(connection_id, events)
-        
-        server_socket = self.create_consumer_server(port, auth_callback, event_callback)
-        
-        # Start advertising
-        capabilities = ['wacom', 'joystick']  # Default capabilities
-        self.start_advertising(port, capabilities)
-        
-        return server_socket
-    
     def connect_to_consumer(self, address: str, port: int, handshake_data: Dict[str, Any]) -> Optional[socket.socket]:
         """Connect to a consumer with proper handshake data."""
         try:

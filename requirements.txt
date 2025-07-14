@@ -13,6 +13,4 @@ pyyaml>=6.0
 # GUI dependencies
 pystray>=0.19.0
 Pillow>=9.0.0
-plyer>=2.1.0  # For desktop notifications
-PyGObject>=3.42.0  # Required for pystray on Linux
-dbus-python>=1.2.0  # Required for D-Bus communication on Linux
+PyGObject>=3.42.0  # Required for notifications and pystray on Linux

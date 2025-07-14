@@ -1,5 +1,57 @@
-__pycache__/*
-docs/
-tests/
-src/
-legacy/
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Development
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Config files (may contain sensitive data)
+config.yml
+*.log
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Documentation artifacts
+README.html
+README_files/
+
+# Test artifacts
+.coverage
+.pytest_cache/
+htmlcov/
+
+# Virtual environments
+venv/
+env/
+ENV/
