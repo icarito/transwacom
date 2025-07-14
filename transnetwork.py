@@ -166,7 +166,7 @@ class TransNetwork:
         self.service_browser = None
         self.listener = None
         self.active_connections = {}
-        self.incoming_sockets = {}  # key: host_name, value: socket
+        self.incoming_sockets = {}  # key: host_name, value: list of sockets
         
     def __enter__(self):
         return self
@@ -398,16 +398,20 @@ class TransNetwork:
                         if msg_type == 'handshake':
                             # Handle authorization
                             host_name = message.get('host_name', str(client_addr))
-                            accepted = auth_callback(message)
+                            accepted_host_name = auth_callback(message)
                             auth_response = self.protocol.create_auth_response(
-                                accepted, 
+                                bool(accepted_host_name), 
                                 socket.gethostname(),
                                 "consumer_id_placeholder"  # Should come from config
                             )
                             client_sock.sendall(self.protocol.pack_message(auth_response))
-                            if accepted:
-                                # Guardar el socket para desconexión futura
-                                self.incoming_sockets[host_name] = client_sock
+                            if accepted_host_name:
+                                # Usar el host_name retornado por auth_callback para registrar la conexión
+                                final_host_name = accepted_host_name
+                                if final_host_name not in self.incoming_sockets:
+                                    self.incoming_sockets[final_host_name] = []
+                                self.incoming_sockets[final_host_name].append(client_sock)
+                                host_name = final_host_name  # Actualizar para usar en cleanup
                                 handshake_done = True
                             else:
                                 client_sock.close()
@@ -417,15 +421,20 @@ class TransNetwork:
                             events = message.get('events', [])
                             event_callback(device_type, events)
                         elif msg_type == 'disconnect':
-                            print(f"Client {client_addr} disconnected: {message.get('reason')}")
+                            print(f"Host {client_addr} disconnected: {message.get('reason')}")
                             break
                 
             except Exception as e:
                 print(f"Error handling client {client_addr}: {e}")
             finally:
                 # Limpiar socket de la lista si estaba registrado
-                if host_name and host_name in self.incoming_sockets and self.incoming_sockets[host_name] is client_sock:
-                    del self.incoming_sockets[host_name]
+                if host_name and host_name in self.incoming_sockets:
+                    try:
+                        self.incoming_sockets[host_name].remove(client_sock)
+                        if not self.incoming_sockets[host_name]:
+                            del self.incoming_sockets[host_name]
+                    except ValueError:
+                        pass
                 client_sock.close()
 
         def accept_connections():
@@ -447,14 +456,13 @@ class TransNetwork:
         accept_thread = threading.Thread(target=accept_connections, daemon=True)
         accept_thread.start()
         return server_sock
-    def disconnect_incoming_host(self, host_name: str):
-        """Disconnect a specific incoming host by host_name."""
-        sock = self.incoming_sockets.get(host_name)
-        if sock:
+    def disconnect_incoming_host(self, host_name: str, reason: str = 'revoked'):
+        """Disconnect all incoming sockets for a given host_name."""
+        sock_list = self.incoming_sockets.get(host_name, [])
+        for sock in list(sock_list):
             try:
-                # Enviar mensaje de desconexión si es posible
                 try:
-                    disconnect_msg = self.protocol.create_disconnect_message('user_request')
+                    disconnect_msg = self.protocol.create_disconnect_message(reason)
                     sock.sendall(self.protocol.pack_message(disconnect_msg))
                 except Exception:
                     pass
@@ -462,7 +470,12 @@ class TransNetwork:
             except Exception as e:
                 print(f"Error disconnecting incoming host {host_name}: {e}")
             finally:
-                del self.incoming_sockets[host_name]
+                try:
+                    sock_list.remove(sock)
+                except ValueError:
+                    pass
+        if host_name in self.incoming_sockets and not self.incoming_sockets[host_name]:
+            del self.incoming_sockets[host_name]
     
     def get_active_connections(self) -> List[ConnectionInfo]:
         """Get list of active connections."""

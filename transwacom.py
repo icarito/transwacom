@@ -594,12 +594,12 @@ class TransWacomUnified:
         print("Service stopped cleanly.")
 
 
-def server_mode(device_path, remote_host, remote_port, disable_local=True, relative_mode=True):
-    """Modo servidor: lee dispositivo de entrada y reenvía eventos por red"""
+def host_mode(device_path, remote_host, remote_port, disable_local=True, relative_mode=True):
+    """Modo host: lee dispositivo de entrada y reenvía eventos por red al consumer"""
     print(f"Usando dispositivo: {device_path}")
     
     if not EVDEV_AVAILABLE:
-        print("Error: python-evdev es requerido para el modo servidor.")
+        print("Error: python-evdev es requerido para el modo host.")
         print("Instala con: pip install evdev")
         sys.exit(1)
     
@@ -609,6 +609,7 @@ def server_mode(device_path, remote_host, remote_port, disable_local=True, relat
     was_disabled = False
     was_relative = False
 
+    import select
     try:
         # Usar evdev para leer eventos estructurados
         device = InputDevice(device_path)
@@ -617,12 +618,10 @@ def server_mode(device_path, remote_host, remote_port, disable_local=True, relat
         # Configurar tableta Wacom si es detectada
         if "wacom" in device.name.lower() or "pen" in device.name.lower():
             device_id = get_wacom_device_id(device_path)
-            
             if device_id:
                 if relative_mode:
                     print("Intentando poner la tableta en modo relativo...")
                     was_relative = set_wacom_relative_mode(device_id)
-                    
                 if disable_local:
                     print("Intentando desactivar la tableta localmente...")
                     was_disabled = disable_wacom_locally(device_path, device_id)
@@ -634,16 +633,94 @@ def server_mode(device_path, remote_host, remote_port, disable_local=True, relat
         sock.connect((remote_host, remote_port))
         print(f"Conectado exitosamente. Enviando eventos del dispositivo...")
 
-        # Modo evdev estructurado (siempre JSON)
-        for event in device.read_loop():
-            event_data = {
-                'type': event.type,
-                'code': event.code,
-                'value': event.value,
-                'timestamp': event.timestamp()
-            }
-            msg = json.dumps(event_data).encode('utf-8') + b'\n'
-            sock.sendall(msg)
+        # --- NUEVO: Bucle que escucha socket y dispositivo ---
+        sock.setblocking(False)
+        device_fd = device.fileno()
+        sock_fd = sock.fileno()
+        buffer = b''
+        import errno
+        import json
+        running = True
+        while running:
+            # Esperar por datos del dispositivo o del socket
+            rlist, _, _ = select.select([device_fd, sock_fd], [], [], 0.1)
+            # 1. Leer mensajes del socket (del consumer)
+            if sock_fd in rlist:
+                try:
+                    data = sock.recv(1024)
+                    if not data:
+                        print("Conexión cerrada por el consumidor.")
+                        break
+                    buffer += data
+                    while b'\n' in buffer:
+                        line, buffer = buffer.split(b'\n', 1)
+                        if not line:
+                            continue
+                        try:
+                            msg = json.loads(line.decode('utf-8'))
+                            if msg.get('type') == 'disconnect':
+                                motivo = msg.get('reason', 'desconocido')
+                                print(f"Desconectado por el consumidor. Motivo: {motivo}")
+                                running = False
+                                break
+                        except Exception as e:
+                            print(f"Error decodificando mensaje del consumidor: {e}")
+                except Exception as e:
+                    if isinstance(e, OSError) and e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        pass
+                    else:
+                        print(f"Error leyendo del socket: {e}")
+                        break
+            if not running:
+                break
+            # 2. Leer eventos del dispositivo y enviarlos
+            if device_fd in rlist:
+                try:
+                    event = next(device.read_loop())
+                    event_data = {
+                        'type': event.type,
+                        'code': event.code,
+                        'value': event.value,
+                        'timestamp': event.timestamp()
+                    }
+                    msg = json.dumps(event_data).encode('utf-8') + b'\n'
+                    try:
+                        sock.sendall(msg)
+                    except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                        print(f"Conexión cerrada por el consumidor: {e}")
+                        break
+                except StopIteration:
+                    break
+                except Exception as e:
+                    print(f"Error leyendo evento del dispositivo: {e}")
+        # --- FIN NUEVO ---
+    except FileNotFoundError:
+        print(f"Error: Dispositivo no encontrado en {device_path}")
+        sys.exit(1)
+    except PermissionError:
+        print(f"Error: Permiso denegado para leer {device_path}. Ejecuta como superusuario (sudo).")
+        sys.exit(1)
+    except socket.error as e:
+        print(f"Error de conexión: {e}")
+    except KeyboardInterrupt:
+        print("\nHost detenido por el usuario.")
+    except Exception as e:
+        print(f"Ocurrió un error inesperado: {e}")
+    finally:
+        print("Cerrando conexión y restaurando estado del dispositivo...")
+        # Restaurar configuración original de la tableta
+        if device_id:
+            if was_disabled:
+                print("Reactivando tableta localmente...")
+                enable_wacom_locally(device_id)
+            if was_relative:
+                print("Restaurando modo absoluto de la tableta...")
+                restore_wacom_absolute_mode(device_id)
+        if device:
+            device.close()
+        if sock:
+            sock.close()
+        print("Limpieza completada.")
 
     except FileNotFoundError:
         print(f"Error: Dispositivo no encontrado en {device_path}")
@@ -680,8 +757,8 @@ def create_virtual_device(device_type='wacom'):
     # Implementation omitted for brevity
     pass
 
-def client_mode(listen_port, device_type='wacom'):
-    """Modo cliente: recibe eventos por red y los inyecta en dispositivo virtual"""
+def consumer_mode(listen_port, device_type='wacom'):
+    """Modo consumer: recibe eventos por red y los inyecta en dispositivo virtual"""
     virtual_device = None
     sock = None
     conn = None
@@ -723,11 +800,11 @@ def client_mode(listen_port, device_type='wacom'):
                         print(f"Error inesperado al procesar evento: {e}")
                         
     except KeyboardInterrupt:
-        print("\nCliente detenido por el usuario.")
+        print("\nConsumer detenido por el usuario.")
     except Exception as e:
-        print(f"Ocurrió un error en el modo cliente: {e}")
+        print(f"Ocurrió un error en el modo consumer: {e}")
     finally:
-        print("Cerrando conexiones y limpiando recursos del cliente...")
+        print("Cerrando conexiones y limpiando recursos del consumer...")
         if conn:
             conn.close()
         if sock:
@@ -735,7 +812,7 @@ def client_mode(listen_port, device_type='wacom'):
         if virtual_device:
             virtual_device.close()
             print("Dispositivo virtual destruido.")
-        print("Limpieza del cliente completada.")
+        print("Limpieza del consumer completada.")
 
 
 def main():

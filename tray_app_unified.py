@@ -460,15 +460,21 @@ class TransWacomTrayApp(TrayIcon):
     def _create_menu_connection_items(self) -> List[pystray.MenuItem]:
         """Create menu items for active connections."""
         items = []
-        if self.incoming_connections:
-            for host in self.incoming_connections:
-                items.append(pystray.MenuItem(
-                    f"📥 Recibiendo de: {host}",
-                    partial(self._disconnect_incoming, host),
-                    enabled=True
-                ))
-        
+        # Mostrar solo hosts realmente conectados (presentes en incoming_sockets)
+        incoming_sockets = getattr(self.network, 'incoming_sockets', {})
+        if incoming_sockets:
+            items.append(pystray.MenuItem("🔗 Conexiones entrantes:", None, enabled=False))
+            for host, sock_list in incoming_sockets.items():
+                for idx, _ in enumerate(sock_list, 1):
+                    label = f"❌ Desconectar {host} #{idx}" if len(sock_list) > 1 else f"❌ Desconectar {host}"
+                    items.append(pystray.MenuItem(
+                        label,
+                        partial(self._disconnect_incoming, host),
+                        enabled=True
+                    ))
+        # Salientes (dispositivos que este host comparte a otros)
         if self.outgoing_connections:
+            items.append(pystray.MenuItem(" ", None, enabled=False))
             for consumer_id, info in self.outgoing_connections.items():
                 consumer_name = info.get('name', 'Unknown')
                 device_name = info.get('device_name', 'Unknown Device')
@@ -664,23 +670,30 @@ class TransWacomTrayApp(TrayIcon):
         if host_name in self.incoming_connections:
             self.incoming_connections.remove(host_name)
             logger.info(f"Intentando desconectar {host_name}. Conexiones activas: {list(self.network.active_connections.keys())}")
-            # Buscar el socket asociado al host_name
-            peer_addr = next((addr for addr, conn_info in self.network.active_connections.items() if conn_info.get('host_name') == host_name), None)
-            if peer_addr and peer_addr in self.network.active_connections:
-                sock = self.network.active_connections[peer_addr]['socket']
-                try:
-                    self.network.disconnect_from_consumer(sock)  # Cerrar conexión de red
-                except Exception as e:
-                    logger.error(f"Error al cerrar la conexión de red: {e}")
-                # Destruir dispositivos virtuales asociados
-                try:
-                    if hasattr(self, 'device_manager'):
-                        self.device_manager.destroy_all_devices()
-                        logger.info(f"Dispositivo virtual destruido tras desconexión de {host_name}")
-                except Exception as e:
-                    logger.error(f"Error destruyendo dispositivo virtual: {e}")
-            else:
-                logger.warning(f"No se encontró una conexión activa para {host_name} o ya fue cerrada.")
+            
+            # Usar el método correcto que envía mensaje disconnect antes de cerrar
+            try:
+                self.network.disconnect_incoming_host(host_name, 'revoked')
+                logger.info(f"Mensaje disconnect enviado y conexión cerrada para {host_name}")
+            except Exception as e:
+                logger.error(f"Error al desconectar host {host_name}: {e}")
+            
+            # Destruir dispositivos virtuales asociados
+            try:
+                if hasattr(self, 'device_manager'):
+                    self.device_manager.destroy_all_devices()
+                    logger.info(f"Dispositivo virtual destruido tras desconexión de {host_name}")
+            except Exception as e:
+                logger.error(f"Error destruyendo dispositivo virtual: {e}")
+
+            # Revocar permiso: eliminar host de la lista de confianza
+            self.config.remove_trusted_host(host_name)
+            logger.info(f"Permiso revocado: {host_name} eliminado de trusted_hosts.")
+            self.show_notification(
+                "Permiso revocado",
+                f"{host_name} ha sido eliminado de la lista de hosts confiables. Futuras conexiones requerirán autorización."
+            )
+
             self.show_notification(
                 "Conexión Finalizada",
                 f"Se ha desconectado de {host_name}"
